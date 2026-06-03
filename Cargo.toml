@@ -1,0 +1,44 @@
+[package]
+name = "mcu-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "面向 AI Agent 的嵌入式调试中间件。通过缓冲区解耦 Agent 慢思考与 MCU 快执行。"
+license = "MIT"
+
+[[bin]]
+name = "mcu-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+rustyline = "18"
+
+# 调试探针
+probe-rs = "0.31"
+
+# JSON-Lines 协议
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 诊断日志
+log = "0.4"
+env_logger = "0.11"
+
+# 配置与路径
+toml = "0.8"
+dirs = "6"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+
+[profile.dev]
+# 加快 debug 模式编译
+opt-level = 0

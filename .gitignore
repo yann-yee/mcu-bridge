@@ -1,0 +1,19 @@
+# Rust build artifacts
+target/
+
+# Environment file with API keys
+.env
+
+# Editor temp files
+*.swp
+*.swo
+*~
+.*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
