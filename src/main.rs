@@ -38,8 +38,18 @@ fn main() -> anyhow::Result<()> {
                 interface,
             })?;
         }
-        Commands::Flash { elf, verify, chip } => {
-            cli::flash::handle(&cli::flash::FlashArgs { elf, verify, chip })?;
+        Commands::Flash {
+            elf,
+            verify,
+            chip,
+            run,
+        } => {
+            cli::flash::handle(&cli::flash::FlashArgs {
+                elf,
+                verify,
+                chip,
+                run,
+            })?;
         }
         Commands::Clean { all, older_than } => {
             cli::clean::handle(&cli::clean::CleanArgs { all, older_than })?;

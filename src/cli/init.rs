@@ -18,7 +18,7 @@ pub struct InitArgs {
 }
 
 /// 内置芯片模板库（P0 硬编码一个模板，P2 扩展为文件模板）
-fn get_chip_template(name: &str) -> anyhow::Result<ChipConfig> {
+pub(crate) fn get_chip_template(name: &str) -> anyhow::Result<ChipConfig> {
     match name.to_ascii_uppercase().as_str() {
         "STM32F407VG" | "STM32F407" => Ok(ChipConfig {
             name: "STM32F407VG".into(),

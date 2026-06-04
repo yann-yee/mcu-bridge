@@ -47,6 +47,7 @@
 
 - **[P0] DebugProbe trait + probe-rs backend 基础**: attach/detach/flash/halt/resume/step/断点/内存读写/寄存器读写。probe-rs 直驱，无外部进程依赖。
 - **[P0] CLI 框架 (clap) + 顶层子命令**: `init`（生成 .debugger/chip.toml）、`flash`（烧录 ELF）、`clean`（缓存清理）、`debug`（进入调试会话）。
+- **[P0] flash 子命令真实烧录**: Standalone 模式 probe-rs attach → flash → detach，`--chip`/`.debugger/chip.toml` 配置源，`--run` 自动运行，`--verify` 默认开启回读校验。
 - **[P1] DebugBuffer + 定时采样 + ring buffer**: 独立线程，默认 10ms 周期通过 SWD 读取 watch target 值；断点触发时额外记录寄存器快照；连接恢复标记 gap。
 - **[P1] debug 子命令 + Human REPL + --json 模式 + schema 协议发现**: 双模式界面，Human REPL 有颜色和折叠，JSON-Lines 模式完整输出。schema 命令自描述协议。
 - **[P1] 探针连接自恢复**: `is_connected()` 检测 + `try_recover()` 重连（默认 3 次，间隔 500ms）+ 断点/watch 自动恢复。恢复失败时保留 buffer 数据优雅退出。
@@ -108,6 +109,8 @@
 
 - **诊断日志选型：`log` + `env_logger`（否定 tracing、否定 eprintln!）**: probe-rs 内部使用 `log` crate，同生态可直接通过 `RUST_LOG=probe_rs=debug` 看到探针库内部诊断。Human REPL 模式 stderr 彩色输出，JSON 模式 stdout 协议分离。否定了 tracing（async span 优势用不上）+ 手工 eprintln!（无级别过滤、无法切换输出目标）。
 
+- **Flash 烧录子命令策略：Standalone 即用即走模式**: `mcu-bridge flash` 使用独立临时 `ProbeRsBackend` 完成 attach → flash → detach，不与 `debug` 会话共享状态。芯片配置按 `--chip` 参数 > `.debugger/chip.toml` 优先级。烧录后默认 halt（等待用户/Agent 设断点），`--run` 参数使目标自动复位运行。校验默认开启（`--verify` true），可用 `--no-verify` 关闭。进度信息输出到 stderr。仅支持 probe-rs 后端（OpenOCD 待 P2）。否定了"依赖 debug session session 复用"（跨命令共享状态复杂）和"默认运行烧录后自动运行"（开发调试场景需要 halt 检查）。已对齐归档于 [user_plan/flash-probe-rs/flash-probe-rs.md](user_plan/flash-probe-rs/flash-probe-rs.md)。
+
 ### 2. 核心功能流程定义
 
 - **Agent 标准调试闭环流程**:
@@ -149,3 +152,4 @@
 - **[2026-06-03]**: 项目骨架搭建完成。基于 Understanding (Grill Me) 三轮烤问确立三大技术决策：(1) 异步运行时 std::thread+mpsc，(2) 错误处理 thiserror+anyhow 分层，(3) 诊断日志 log+env_logger。决策已归档到 §四.1 架构决策。项目骨架含 Cargo.toml（10个依赖）、18个 .rs 源文件（trait/struct/enum 骨架）、rustfmt.toml、.gitignore、.github/workflows/ci.yml。cargo check + cargo fmt + cargo run --help 全量通过。需求规格书/任务清单/编码红线归档于 user_plan/proj-skeleton/。(By Agent - Understanding/Code-Spec)
 - **[2026-06-03]**: 落实三项待确认事项的用户决策：(1) RTT CB RAM 搜索策略确认为基于 ELF `.noinit` 段，移入 §四.1 架构决策；(2) Buffer 快照回放确认为需支持，追加为 §三.1 P2 核心目标；(3) Semihosting 延迟标记调整为 [待测试]，保留在 §四.3。同步更新设计文档 §11。(By Agent - Context-of-User)
 - **[2026-06-03]**: 初始化本档案。从 `嵌入式调试软件.md` 设计文档中提炼项目一句话定位、核心受众、专有名词词汇表（mcu-bridge/DebugProbe/DebugBuffer/LogChannel/RTT/SWD/ring buffer/watch target/JSON-Lines/schema 协议发现/Flash 断点等 16 项）、P0-P3 实施路线里程碑、排除范围（不做 IDE 插件/GUI/GDB 协议/无线调试等 8 项）、架构决策与权衡理由（Rust 选型/probe-rs 优先/三级 fallback/单线程多核/关键词匹配/Flash 断点默认关闭等 8 项）、3 项待确认事项。(By Agent - Context-of-User)
+- **[2026-06-04]**: 伴随需求 [user_plan/flash-probe-rs/flash-probe-rs.md](user_plan/flash-probe-rs/flash-probe-rs.md) 探底自检同步更新 Glossary 与 Non-Goals 属性。新增决策：Flash 烧录 Standalone 模式、芯片配置优先级规则、烧录后默认 halt/--run 运行、--verify 默认开启回读校验、进度 stderr 输出、仅 probe-rs 后端。已归档到 §四.1 架构决策。(By Agent - Understanding/Context-of-User)

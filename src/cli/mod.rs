@@ -47,6 +47,9 @@ pub enum Commands {
         /// 芯片型号（默认从 ELF 中检测）
         #[arg(long)]
         chip: Option<String>,
+        /// 烧录完成后自动复位运行（默认 halt）
+        #[arg(long)]
+        run: bool,
     },
 
     /// 清理缓存目录 (~/.mcu_bridge/)

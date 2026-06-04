@@ -1,34 +1,133 @@
 //! flash 子命令 — 烧录 ELF 固件到目标芯片。
 //!
-//! 设计文档 §4.1：`mcu-bridge flash --elf target/firmware.elf [--verify]`
+//! 设计文档 §4.1：`mcu-bridge flash --elf target/firmware.elf [--verify] [--run]`
 //!
-//! P0 阶段: dry-run — 仅校验参数 + 输出诊断信息，实际烧录留 P1。
+//! Standalone 模式：临时创建 ProbeRsBackend → attach → flash → detach。
+//! 芯片配置来源（按优先级）：
+//!   1. `--chip` 命令行参数
+//!   2. `.debugger/chip.toml` 配置文件
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::cli::init;
+use crate::config::{AppConfig, ChipConfig, FlashOpts, FlashSection};
+use crate::probe::DebugProbe;
+use crate::probe::probe_rs::ProbeRsBackend;
 
 /// flash 子命令参数
 pub struct FlashArgs {
     pub elf: PathBuf,
     pub verify: bool,
     pub chip: Option<String>,
+    pub run: bool,
 }
 
-/// 处理 flash 子命令 (P0 dry-run)
+/// 从 `.debugger/chip.toml` 加载完整配置。
+fn load_config_from_dot_debugger() -> anyhow::Result<AppConfig> {
+    let path = Path::new(".debugger/chip.toml");
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    let config: AppConfig =
+        toml::from_str(&content).map_err(|e| anyhow::anyhow!("config parse error: {e}"))?;
+    Ok(config)
+}
+
+/// 解析芯片配置（CLI 参数优先，否则读取配置文件）。
+fn resolve_chip_config(chip_arg: Option<&str>) -> anyhow::Result<(ChipConfig, FlashOpts)> {
+    if let Some(name) = chip_arg {
+        let chip = init::get_chip_template(name)?;
+        let opts = FlashOpts {
+            base: chip.flash_base,
+            size: chip.flash_size,
+            sections: vec![FlashSection {
+                name: "app".into(),
+                addr: chip.flash_base,
+                len: chip.flash_size,
+            }],
+            verify: true,
+        };
+        return Ok((chip, opts));
+    }
+
+    // 回退：尝试读取 .debugger/chip.toml
+    let app = load_config_from_dot_debugger()?;
+    Ok((app.chip, app.flash))
+}
+
+/// 处理 flash 子命令 (Standalone 烧录流程)
 pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
     // 校验 ELF 文件存在
     if !args.elf.exists() {
         anyhow::bail!("ELF file not found: {}", args.elf.display());
     }
 
-    let chip = args.chip.as_deref().unwrap_or("(auto-detect)");
+    // 解析芯片配置
+    let (chip, flash_opts) = resolve_chip_config(args.chip.as_deref())?;
 
-    println!(
-        "flash: ELF={}, chip={}, verify={}",
-        args.elf.display(),
-        chip,
-        args.verify
-    );
-    println!("[INFO] P0 dry-run — actual flash will be supported in P1");
+    eprintln!("[INFO] attaching probe to {}...", chip.name);
 
+    // Standalone 烧录流程
+    let mut backend = ProbeRsBackend::new();
+    backend.attach(&chip)?;
+
+    eprintln!("[INFO] flashing ELF...");
+    backend.flash(&args.elf, &flash_opts)?;
+
+    if args.run {
+        eprintln!("[INFO] resuming target...");
+        backend.resume(None)?;
+    }
+
+    backend.detach()?;
+    println!("[OK] flash complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flash_elf_not_found() {
+        let args = FlashArgs {
+            elf: PathBuf::from("nonexistent.elf"),
+            verify: true,
+            chip: Some("STM32F407VG".into()),
+            run: false,
+        };
+        let err = handle(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ELF file not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_flash_unknown_chip() {
+        let args = FlashArgs {
+            elf: PathBuf::from("Cargo.toml"),
+            verify: true,
+            chip: Some("INVALID".into()),
+            run: false,
+        };
+        let err = handle(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown chip"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_flash_no_chip_no_config() {
+        // 确保 .debugger/chip.toml 不存在
+        let args = FlashArgs {
+            elf: PathBuf::from("Cargo.toml"),
+            verify: true,
+            chip: None,
+            run: false,
+        };
+        let err = handle(&args).unwrap_err();
+        let msg = err.to_string();
+        // 没有 --chip 也没有 .debugger/chip.toml 时应提示需要 chip
+        assert!(
+            msg.contains("cannot read") || msg.contains("not found") || msg.contains("chip"),
+            "got: {msg}"
+        );
+    }
 }
