@@ -43,12 +43,16 @@ fn main() -> anyhow::Result<()> {
             verify,
             chip,
             run,
+            backend,
+            openocd_cfg,
         } => {
             cli::flash::handle(&cli::flash::FlashArgs {
                 elf,
                 verify,
                 chip,
                 run,
+                backend,
+                openocd_cfg,
             })?;
         }
         Commands::Clean { all, older_than } => {

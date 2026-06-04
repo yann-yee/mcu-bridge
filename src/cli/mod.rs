@@ -50,6 +50,12 @@ pub enum Commands {
         /// 烧录完成后自动复位运行（默认 halt）
         #[arg(long)]
         run: bool,
+        /// 强制指定后端: probe-rs | openocd
+        #[arg(long)]
+        backend: Option<String>,
+        /// OpenOCD 配置文件路径（仅 --backend openocd 时生效）
+        #[arg(long)]
+        openocd_cfg: Option<String>,
     },
 
     /// 清理缓存目录 (~/.mcu_bridge/)
