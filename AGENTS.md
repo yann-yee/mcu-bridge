@@ -64,6 +64,11 @@
 
 - **clippy 可用性检查** `[← archive/proj-skeleton 经验]`: Windows 上使用非 rustup 安装的 Rust（如独立 .msi 安装包）可能 `clippy --version` 正常但 `clippy-driver.exe` 缺失，导致 `cargo clippy` 报 "系统找不到指定的文件"。**首次在新环境执行 `cargo clippy` 前，先运行 `cargo clippy -- --help` 验证 driver 可用**。若不可用，骨架期用 `#![allow(dead_code)]` 暂代，正式实现前必须修复 clippy 或切换为 rustup 安装。
 
+- **clippy 不可用时的替代预检策略** `[← archive/debug-round2 经验]`: 当本地 `cargo clippy` 因 `clippy-driver.exe` 缺失而不可用时（即上一条的受害情况），提交前必须执行以下替代检查来模拟 CI 行为：
+  - **全局搜索同类问题**：修复单个 clippy 告警后，必须在整个 `src/` 下 grep 搜索同一模式是否在其他文件中也存在。例如 `collapsible_if` 应搜索嵌套 `if let Some(...) { if ... }` 模式，`needless_lifetimes` 应搜索不必要的生命周期标注。本项目的两次 CI 阻断均因同一 `collapsible_if` 告警在不同文件中先后发作——先修了 `debug.rs` 但漏了 `json_session.rs` 的同类问题。
+  - **提交前人工 checklist**：`cargo check` ✅ → `cargo fmt --all -- --check` ✅ → 手动 grep 搜索当前修复的 lint 名（如 `collapsible_if`、`needless_lifetimes`）在全项目下的所有实例并逐一消除 ✅ → 推送。
+  - **推荐方案**：如果本地 clippy 长期不可用，应卸载独立 .msi 安装的 Rust 并改用 `rustup` 安装——rustup 分发的 Rust 工具链自带完整 `clippy-driver.exe`，可与 CI 保持完全一致的行为。
+
 - **probe-rs API 侦察策略** `[← archive/p0-probe-cli 经验]`: probe-rs 0.31 的公开 API 与其内部模块结构不完全对应——`SessionConfig`/`Permissions`/`Session` 从 `probe_rs::` 直接裸出而非 `probe_rs::session::XXX`，`Core` 的方法 `halt`/`run`/`step` 是 `CoreInterface` trait 方法需 trait 在作用域内，`read_word_32`/`write_word_32` 需 `use probe_rs::MemoryInterface`。**禁止在写实现代码前花大量时间 grep probe-rs 源码**——相反，先写出符合设计文档预期的调用代码，用 `cargo check` 编译，让编译器给出精确的 API 修正提示。每轮 `cargo check` 修复 3-5 个错误，2-3 轮即可收敛。这比提前翻阅源码效率高一个数量级。
 
 - **Rust 借用检查器与 set_breakpoint 模式** `[← archive/p0-probe-cli 经验]`: 当 `DebugProbe` 方法需要同时操作内部状态（如 `bp_map`）和借出 `Core` 时，必须遵循「先修改 self、再借出子对象」的顺序。`get_core()` 返回拥有型 `Core` 后，编译器禁止再访问 `self.next_bp_id`。**标准模式**：先分配 ID/修改计数器/插入 map → 再调用 `self.get_core()` 获取 core → 操作硬件 → 失败时回滚前面已修改的 self 状态。不允许「先借 core、后改 self」的写法。
