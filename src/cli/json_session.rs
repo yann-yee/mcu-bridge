@@ -354,23 +354,23 @@ impl JsonSession {
         }
 
         // 状态守卫
-        if let Some(states) = cmd.valid_states() {
-            if !states.contains(&self.session.state) {
-                let resp = JsonResponse {
-                    id: req.id,
-                    status: "error".into(),
-                    data: None,
-                    error: Some(JsonError {
-                        code: "E_STATE".into(),
-                        message: format!(
-                            "command '{}' not valid in {:?} state",
-                            cmd, self.session.state
-                        ),
-                    }),
-                };
-                Self::send_json(&resp);
-                return false;
-            }
+        if let Some(states) = cmd.valid_states()
+            && !states.contains(&self.session.state)
+        {
+            let resp = JsonResponse {
+                id: req.id,
+                status: "error".into(),
+                data: None,
+                error: Some(JsonError {
+                    code: "E_STATE".into(),
+                    message: format!(
+                        "command '{}' not valid in {:?} state",
+                        cmd, self.session.state
+                    ),
+                }),
+            };
+            Self::send_json(&resp);
+            return false;
         }
 
         // 执行
