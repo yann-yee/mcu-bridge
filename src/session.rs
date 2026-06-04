@@ -4,6 +4,10 @@
 /// 初始状态为 HALTED，不自动 continue——让用户/Agent 先设断点和 watch。
 use log::info;
 
+use crate::config::ChipConfig;
+use crate::probe::DebugProbe;
+use crate::probe::probe_rs::ProbeRsBackend;
+
 /// 会话状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -29,10 +33,39 @@ pub struct Session {
     pub bp_count: usize,
     /// 当前设置的 watchpoint 数
     pub watch_count: usize,
+    /// 调试探针后端
+    pub backend: Box<dyn DebugProbe>,
 }
 
 impl Session {
-    /// 创建一个初始状态为 Halted 的会话。
+    /// 连接探针并创建会话（初始状态 Halted）。
+    pub fn attach(chip: &ChipConfig) -> anyhow::Result<Self> {
+        let mut backend = ProbeRsBackend::new();
+        backend.attach(chip)?;
+        let core_count = backend.core_count();
+        info!("session attached to {} ({} core(s))", chip.name, core_count);
+        Ok(Self {
+            state: SessionState::Halted,
+            chip_name: chip.name.clone(),
+            core_count,
+            pc: None,
+            bp_count: 0,
+            watch_count: 0,
+            backend: Box::new(backend),
+        })
+    }
+
+    /// 安全断开探针连接。
+    pub fn detach(&mut self) -> anyhow::Result<()> {
+        info!("detaching session from {}", self.chip_name);
+        self.backend.detach()
+    }
+
+    /// 创建一个初始状态为 Halted 的会话（无后端连接）。
+    ///
+    /// ⚠ 此方法仅用于无需真实探针连接的场景（如测试）。
+    /// 常规使用请用 [`Session::attach`]。
+    #[deprecated(since = "0.1.0", note = "use Session::attach() instead")]
     pub fn new(chip_name: String) -> Self {
         info!("session created for chip: {}", chip_name);
         Self {
@@ -42,12 +75,21 @@ impl Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
+            backend: Box::new(ProbeRsBackend::new()),
         }
     }
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Self::new("unknown".into())
+        Self {
+            state: SessionState::Halted,
+            chip_name: "unknown".into(),
+            core_count: 0,
+            pc: None,
+            bp_count: 0,
+            watch_count: 0,
+            backend: Box::new(ProbeRsBackend::new()),
+        }
     }
 }

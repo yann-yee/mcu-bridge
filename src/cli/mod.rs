@@ -73,6 +73,9 @@ pub enum Commands {
         /// ELF 文件路径
         #[arg(long)]
         elf: PathBuf,
+        /// 芯片型号（如 STM32F407VG，默认从 .debugger/chip.toml 读取）
+        #[arg(long)]
+        chip: Option<String>,
         /// 配置文件路径（默认自动查找 .debugger/chip.toml）
         #[arg(long)]
         config: Option<PathBuf>,

@@ -72,9 +72,11 @@ fn main() -> anyhow::Result<()> {
             halt_on_start,
             sampling_interval,
             serial_port,
+            chip,
         } => {
             cli::debug::handle(&cli::debug::DebugArgs {
                 elf,
+                chip,
                 config,
                 json,
                 no_flash,
