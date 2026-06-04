@@ -1,6 +1,9 @@
 # Rust build artifacts
 target/
 
+# Test firmware build artifacts
+test_firmware/*.elf
+
 # Environment file with API keys
 .env
 
