@@ -2,6 +2,8 @@
 ///
 /// 设计文档 §4.2 定义了 HALTED / RUNNING / RECOVERING 三态状态机。
 /// 初始状态为 HALTED，不自动 continue——让用户/Agent 先设断点和 watch。
+use std::sync::{Arc, Mutex};
+
 use log::info;
 
 use crate::config::ChipConfig;
@@ -32,8 +34,8 @@ pub struct Session {
     pub bp_count: usize,
     /// 当前设置的 watchpoint 数
     pub watch_count: usize,
-    /// 调试探针后端
-    pub backend: Box<dyn DebugProbe>,
+    /// 调试探针后端（Arc<Mutex> 支持多线程共享）
+    pub backend: Arc<Mutex<Box<dyn DebugProbe>>>,
 }
 
 impl Session {
@@ -52,14 +54,19 @@ impl Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend,
+            backend: Arc::new(Mutex::new(backend)),
         })
+    }
+
+    /// 返回共享后端引用（供采样线程持有）。
+    pub fn shared_backend(&self) -> Arc<Mutex<Box<dyn DebugProbe>>> {
+        self.backend.clone()
     }
 
     /// 安全断开探针连接。
     pub fn detach(&mut self) -> anyhow::Result<()> {
         info!("detaching session from {}", self.chip_name);
-        self.backend.detach()
+        self.backend.lock().unwrap().detach()
     }
 
     /// 创建一个初始状态为 Halted 的会话（无后端连接）。
@@ -76,7 +83,9 @@ impl Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend: Box::new(crate::probe::probe_rs::ProbeRsBackend::new()),
+            backend: Arc::new(Mutex::new(Box::new(
+                crate::probe::probe_rs::ProbeRsBackend::new(),
+            ))),
         }
     }
 }
@@ -90,7 +99,9 @@ impl Default for Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend: Box::new(crate::probe::probe_rs::ProbeRsBackend::new()),
+            backend: Arc::new(Mutex::new(Box::new(
+                crate::probe::probe_rs::ProbeRsBackend::new(),
+            ))),
         }
     }
 }

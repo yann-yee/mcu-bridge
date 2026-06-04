@@ -27,6 +27,8 @@ pub struct ProbeRsBackend {
     bp_map: HashMap<u64, BpId>,
     /// watchpoint ID 计数器
     next_wp_id: WpId,
+    /// 目标是否处于 halted 状态（由 halt/resume/wait_for_core_halted 同步更新）
+    target_halted: bool,
 }
 
 impl ProbeRsBackend {
@@ -39,6 +41,7 @@ impl ProbeRsBackend {
             next_bp_id: 0,
             bp_map: HashMap::new(),
             next_wp_id: 0,
+            target_halted: false,
         }
     }
 
@@ -107,16 +110,22 @@ impl DebugProbe for ProbeRsBackend {
     }
 
     fn halt(&mut self, core: Option<usize>) -> anyhow::Result<()> {
-        let mut core = self.get_core(core)?;
-        core.halt(Duration::from_millis(500))
-            .map_err(|e| anyhow::anyhow!("halt failed: {e}"))?;
+        {
+            let mut core = self.get_core(core)?;
+            core.halt(Duration::from_millis(500))
+                .map_err(|e| anyhow::anyhow!("halt failed: {e}"))?;
+        }
+        self.target_halted = true;
         Ok(())
     }
 
     fn resume(&mut self, core: Option<usize>) -> anyhow::Result<()> {
-        let mut core = self.get_core(core)?;
-        core.run()
-            .map_err(|e| anyhow::anyhow!("resume failed: {e}"))?;
+        {
+            let mut core = self.get_core(core)?;
+            core.run()
+                .map_err(|e| anyhow::anyhow!("resume failed: {e}"))?;
+        }
+        self.target_halted = false;
         Ok(())
     }
 
@@ -232,8 +241,25 @@ impl DebugProbe for ProbeRsBackend {
         Ok(map)
     }
 
-    fn is_halted(&self, _core: Option<usize>) -> bool {
-        // P1 实现 — 需调用 core.core_halted()
+    fn is_halted(&mut self, _core: Option<usize>) -> bool {
+        self.target_halted
+    }
+
+    fn poll_halted(&mut self, core: Option<usize>) -> bool {
+        if self.target_halted {
+            return true;
+        }
+        // 用 1ms 短超时检测核心是否刚刚 halt
+        let idx = core.unwrap_or(self.active_core);
+        let halted = self.session.as_mut().and_then(|s| {
+            s.core(idx)
+                .ok()
+                .map(|mut c| c.wait_for_core_halted(Duration::from_millis(1)).is_ok())
+        });
+        if halted == Some(true) {
+            self.target_halted = true;
+            return true;
+        }
         false
     }
 }

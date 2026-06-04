@@ -8,10 +8,13 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use crate::buffer::{DebugBuffer, Sampler};
 use crate::cli::init;
 use crate::cli::json_session::JsonSession;
 use crate::config::{ChipConfig, FlashOpts};
@@ -59,6 +62,17 @@ pub enum Command {
     Help,
     /// 退出会话
     Quit,
+    /// 添加 watch target
+    Watch {
+        addr: u32,
+        size: u32,
+        label: Option<String>,
+    },
+    /// 查询采样历史
+    Buffer {
+        since: Option<u64>,
+        watch_id: Option<usize>,
+    },
 }
 
 impl fmt::Display for Command {
@@ -73,6 +87,23 @@ impl fmt::Display for Command {
             Self::Status => write!(f, "status"),
             Self::Help => write!(f, "help"),
             Self::Quit => write!(f, "quit"),
+            Self::Watch { addr, size, label } => {
+                if let Some(l) = label {
+                    write!(f, "watch 0x{addr:08x}:{size}:{l}")
+                } else {
+                    write!(f, "watch 0x{addr:08x}:{size}")
+                }
+            }
+            Self::Buffer { since, watch_id } => {
+                write!(f, "buffer")?;
+                if let Some(s) = since {
+                    write!(f, " --since {s}")?;
+                }
+                if let Some(w) = watch_id {
+                    write!(f, " --watch {w}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -151,6 +182,44 @@ impl Command {
             }
             "help" | "h" | "?" => Ok(Self::Help),
             "quit" | "exit" | "q" => Ok(Self::Quit),
+            "watch" | "w" => {
+                if parts.len() < 2 {
+                    return Err("usage: watch <addr>:<size>[:<label>]".into());
+                }
+                let (addr, size, label) =
+                    crate::buffer::DebugBuffer::parse_watch_spec(parts[1]).map_err(|e| e)?;
+                Ok(Self::Watch { addr, size, label })
+            }
+            "buffer" | "buff" => {
+                let mut since = None;
+                let mut watch_id = None;
+                let mut i = 1;
+                while i < parts.len() {
+                    match parts[i] {
+                        "--since" => {
+                            i += 1;
+                            if i >= parts.len() {
+                                return Err("usage: buffer --since <sn>".into());
+                            }
+                            since = Some(parts[i].parse::<u64>().map_err(|_| {
+                                format!("invalid sn: '{}'. Use decimal.", parts[i])
+                            })?);
+                        }
+                        "--watch" => {
+                            i += 1;
+                            if i >= parts.len() {
+                                return Err("usage: buffer --watch <id>".into());
+                            }
+                            watch_id = Some(parts[i].parse::<usize>().map_err(|_| {
+                                format!("invalid watch id: '{}'. Use decimal.", parts[i])
+                            })?);
+                        }
+                        _ => return Err(format!("unknown option: '{}'", parts[i])),
+                    }
+                    i += 1;
+                }
+                Ok(Self::Buffer { since, watch_id })
+            }
             _ => Err(format!(
                 "unknown command '{}'. Type 'help' for available commands.",
                 parts[0]
@@ -167,7 +236,8 @@ impl Command {
             Self::Resume | Self::Step | Self::Break { .. } | Self::Regs | Self::Mem { .. } => {
                 Some(&[SessionState::Halted])
             }
-            Self::Status | Self::Help | Self::Quit => None,
+            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } => None,
+            Self::Watch { .. } => Some(&[SessionState::Halted]),
         }
     }
 }
@@ -187,16 +257,28 @@ pub struct DebugRepl {
     session: Session,
     /// rustyline 行编辑器
     rl: DefaultEditor,
+    /// 共享调试缓冲区
+    buffer: Arc<RwLock<DebugBuffer>>,
+    /// 采样线程句柄
+    sampler_thread: Option<std::thread::JoinHandle<()>>,
+    /// 采样停止信号
+    sampler_stop: Option<Arc<AtomicBool>>,
+    /// 采样间隔（ms）
+    sampling_interval: u64,
 }
 
 impl DebugRepl {
     /// 创建 REPL 实例。
-    pub fn new(session: Session) -> Self {
-        let rl = DefaultEditor::new().unwrap_or_else(|_| {
-            // 如果无法创建编辑器，使用无历史回退
-            DefaultEditor::new().unwrap()
-        });
-        Self { session, rl }
+    pub fn new(session: Session, sampling_interval: u64, buffer_capacity: usize) -> Self {
+        let rl = DefaultEditor::new().unwrap_or_else(|_| DefaultEditor::new().unwrap());
+        Self {
+            session,
+            rl,
+            buffer: Arc::new(RwLock::new(DebugBuffer::new(buffer_capacity))),
+            sampler_thread: None,
+            sampler_stop: None,
+            sampling_interval,
+        }
     }
 
     /// 进入主交互循环，直至用户 quit 或出现致命错误。
@@ -269,6 +351,8 @@ impl DebugRepl {
                 Ok(())
             }
             Command::Quit => Ok(()), // handled by run()
+            Command::Watch { addr, size, label } => self.cmd_watch(addr, size, label),
+            Command::Buffer { since, watch_id } => self.cmd_buffer(since, watch_id),
         }
     }
 
@@ -276,25 +360,96 @@ impl DebugRepl {
 
     /// 暂停目标
     fn cmd_halt(&mut self) -> anyhow::Result<()> {
-        self.session.backend.halt(None)?;
+        // 先停止采样线程
+        self.stop_sampler();
+        self.session.backend.lock().unwrap().halt(None)?;
         self.session.state = SessionState::Halted;
         println!("[OK] target halted");
         Ok(())
     }
 
-    /// 全速运行
+    /// 全速运行 — 自动启动采样线程
     fn cmd_resume(&mut self) -> anyhow::Result<()> {
-        self.session.backend.resume(None)?;
+        self.session.backend.lock().unwrap().resume(None)?;
         self.session.state = SessionState::Running;
-        println!("[OK] target running");
+
+        // 如果有 watch target，启动采样线程
+        let watch_count = self.buffer.read().unwrap().targets.len();
+        if watch_count > 0 {
+            let backend = self.session.shared_backend();
+            let buffer = self.buffer.clone();
+            let mut sampler = Sampler::new(backend, buffer, self.sampling_interval, 0);
+            let stop_flag = sampler.stop_flag();
+            self.sampler_stop = Some(stop_flag);
+            self.sampler_thread = Some(std::thread::spawn(move || {
+                sampler.run();
+            }));
+            println!(
+                "[OK] target running | sampling {watch_count} target(s) @ {}ms",
+                self.sampling_interval
+            );
+        } else {
+            println!("[OK] target running (no watch targets, sampling not started)");
+        }
+        Ok(())
+    }
+
+    /// 停止采样线程
+    fn stop_sampler(&mut self) {
+        if let Some(stop) = self.sampler_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.sampler_thread.take() {
+            handle.join().ok();
+        }
+    }
+
+    /// 添加 watch target
+    fn cmd_watch(&mut self, addr: u32, size: u32, label: Option<String>) -> anyhow::Result<()> {
+        let id = self
+            .buffer
+            .write()
+            .unwrap()
+            .add_target(addr, size, label.clone());
+        let label = label.unwrap_or_else(|| format!("0x{addr:08x}"));
+        println!("[#{}] watching {label} at 0x{addr:08x} (size={size})", id);
+        self.session.watch_count = self.buffer.read().unwrap().targets.len();
+        Ok(())
+    }
+
+    /// 查询采样历史
+    fn cmd_buffer(&self, since: Option<u64>, watch_id: Option<usize>) -> anyhow::Result<()> {
+        let samples = self.buffer.read().unwrap().get_samples(watch_id, since);
+        if samples.is_empty() || samples.iter().all(|v| v.is_empty()) {
+            println!("[OK] no samples");
+            return Ok(());
+        }
+        // 获取标签列表（在 guard 内拷贝）
+        let labels: Vec<String> = {
+            let guard = self.buffer.read().unwrap();
+            guard.targets.iter().map(|t| t.label.clone()).collect()
+        };
+        for (i, buf) in samples.iter().enumerate() {
+            let label = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
+            println!("--- {label} ({} samples) ---", buf.len());
+            for sample in buf {
+                println!(
+                    "#{sn} t={tick} val=0x{val:x} bp={bp}",
+                    sn = sample.sn,
+                    tick = sample.tick_us,
+                    val = sample.val,
+                    bp = if sample.bp_flag { "Y" } else { "N" }
+                );
+            }
+        }
         Ok(())
     }
 
     /// 单步执行
     fn cmd_step(&mut self) -> anyhow::Result<()> {
-        self.session.backend.step(None)?;
+        self.session.backend.lock().unwrap().step(None)?;
         // 读取 PC 显示当前位置
-        if let Ok(regs) = self.session.backend.read_regs(None) {
+        if let Ok(regs) = self.session.backend.lock().unwrap().read_regs(None) {
             if let Some(pc_val) = regs.get("pc").or_else(|| regs.get("PC")) {
                 let pc = *pc_val as u32;
                 self.session.pc = Some(pc);
@@ -311,7 +466,12 @@ impl DebugRepl {
 
     /// 设硬件断点
     fn cmd_break(&mut self, addr: u32) -> anyhow::Result<()> {
-        let id = self.session.backend.set_breakpoint(addr, None)?;
+        let id = self
+            .session
+            .backend
+            .lock()
+            .unwrap()
+            .set_breakpoint(addr, None)?;
         self.session.bp_count += 1;
         println!("[#{}] breakpoint at 0x{addr:08x}", id);
         Ok(())
@@ -319,7 +479,7 @@ impl DebugRepl {
 
     /// 显示寄存器
     fn cmd_regs(&mut self) -> anyhow::Result<()> {
-        let regs = self.session.backend.read_regs(None)?;
+        let regs = self.session.backend.lock().unwrap().read_regs(None)?;
         // 收集并排序 key
         let mut keys: Vec<&String> = regs.keys().collect();
         keys.sort();
@@ -337,7 +497,12 @@ impl DebugRepl {
 
     /// 读取内存
     fn cmd_mem(&mut self, addr: u32, len: u32) -> anyhow::Result<()> {
-        let data = self.session.backend.read_mem(addr, len, None)?;
+        let data = self
+            .session
+            .backend
+            .lock()
+            .unwrap()
+            .read_mem(addr, len, None)?;
         // 十六进制 dump，每行 16 字节
         for (i, chunk) in data.chunks(16).enumerate() {
             let line_addr = addr + (i as u32 * 16);
@@ -393,11 +558,13 @@ impl DebugRepl {
     fn print_help(&self) {
         println!("Available commands:");
         println!("  halt              Pause target execution");
-        println!("  resume, go        Resume target execution");
+        println!("  resume, go        Resume target execution (starts sampler)");
         println!("  step, s           Single-step (halted)");
         println!("  break <addr>, b   Set hardware breakpoint (halted)");
         println!("  regs, registers   Show core registers (halted)");
         println!("  mem <addr> <len>  Read memory (halted)");
+        println!("  watch <a>:<s>[:l] Add watch target, e.g. 0x20000000:4:counter (halted)");
+        println!("  buffer [--since N] Show sampling history");
         println!("  status, st        Show session status");
         println!("  help, h, ?        Show this help");
         println!("  quit, exit, q     Exit debug session");
@@ -494,7 +661,11 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     // 烧录固件（除非 --no-flash）
     if !args.no_flash {
         println!("[INFO] flashing ELF...");
-        session.backend.flash(&args.elf, &flash_opts)?;
+        session
+            .backend
+            .lock()
+            .unwrap()
+            .flash(&args.elf, &flash_opts)?;
         println!("[OK] flash complete");
     }
 
@@ -502,23 +673,38 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     for addr_str in &args.break_at {
         let addr = parse_u32(addr_str)
             .map_err(|_| anyhow::anyhow!("invalid breakpoint address: '{addr_str}'"))?;
-        let id = session.backend.set_breakpoint(addr, None)?;
+        let id = session.backend.lock().unwrap().set_breakpoint(addr, None)?;
         println!("[#{}] breakpoint at 0x{addr:08x}", id);
     }
 
     // halt-on-start 优先；仅当未指定 halt-on-start 且指定了 continue 时才 resume
     if !args.halt_on_start && args.continue_ {
-        session.backend.resume(None)?;
+        session.backend.lock().unwrap().resume(None)?;
         session.state = SessionState::Running;
         println!("[OK] target running");
     }
 
+    // 采样与观测配置
+    let sampling_interval = args.sampling_interval.unwrap_or(10);
+    let buffer_capacity = 128;
+
     // 路由到对应界面
     if args.json {
-        let mut js = JsonSession::new(session);
+        let mut js = JsonSession::new(session, sampling_interval, buffer_capacity);
         js.run()?;
     } else {
-        let mut repl = DebugRepl::new(session);
+        let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity);
+
+        // 处理 --watch 参数（启动时添加观测目标）
+        for watch_spec in &args.watch_targets {
+            let (addr, size, label) = DebugBuffer::parse_watch_spec(watch_spec)
+                .map_err(|e| anyhow::anyhow!("--watch parse error: {e}"))?;
+            repl.cmd_watch(addr, size, label)?;
+        }
+
+        // 如果指定了 --continue_ 且有 watch target，resume 会自动启动采样
+        // 如果指定了 --watch 但没有 --continue_，用户手动 resume 时启动采样
+
         repl.run()?;
     }
 

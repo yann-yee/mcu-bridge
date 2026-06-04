@@ -6,11 +6,14 @@
 //!   异步事件推送 `{"event":"halted","data":{"pc":N,"core":N}}`
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::buffer::{DebugBuffer, Sampler};
 use crate::cli::debug::Command;
 use crate::session::{Session, SessionState};
 
@@ -161,6 +164,45 @@ fn generate_schema() -> SchemaData {
             args: None,
             valid_states: vec![],
         },
+        CommandMeta {
+            name: "watch".into(),
+            description: "Add a memory watch target".into(),
+            args: Some(vec![
+                ArgMeta {
+                    name: "addr".into(),
+                    arg_type: "u32".into(),
+                    required: true,
+                },
+                ArgMeta {
+                    name: "size".into(),
+                    arg_type: "u32".into(),
+                    required: true,
+                },
+                ArgMeta {
+                    name: "label".into(),
+                    arg_type: "string".into(),
+                    required: false,
+                },
+            ]),
+            valid_states: vec!["Halted".into()],
+        },
+        CommandMeta {
+            name: "buffer".into(),
+            description: "Query sampling history".into(),
+            args: Some(vec![
+                ArgMeta {
+                    name: "since".into(),
+                    arg_type: "u64".into(),
+                    required: false,
+                },
+                ArgMeta {
+                    name: "watch_id".into(),
+                    arg_type: "usize".into(),
+                    required: false,
+                },
+            ]),
+            valid_states: vec![],
+        },
     ];
 
     let error_codes = HashMap::from([
@@ -268,6 +310,37 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
         "help" => Ok(Command::Help),
         "quit" => Ok(Command::Quit),
         "schema" => unreachable!(), // handled in handle_request before json_to_command
+        "watch" => {
+            let addr = req
+                .args
+                .get("addr")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'addr'".into()))?;
+            let size = req
+                .args
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'size'".into()))?;
+            let label = req
+                .args
+                .get("label")
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            if !matches!(size, 1 | 2 | 4 | 8) {
+                return Err(err_response("E_PARAM", "size must be 1, 2, 4, or 8".into()));
+            }
+            Ok(Command::Watch { addr, size, label })
+        }
+        "buffer" => {
+            let since = req.args.get("since").and_then(|v| v.as_u64());
+            let watch_id = req
+                .args
+                .get("watch_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            Ok(Command::Buffer { since, watch_id })
+        }
         unknown => Err(err_response(
             "E_PARAM",
             format!("unknown command '{}'", unknown),
@@ -281,12 +354,26 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
 pub struct JsonSession {
     /// 底层调试会话
     session: Session,
+    /// 共享调试缓冲区
+    buffer: Arc<RwLock<DebugBuffer>>,
+    /// 采样线程句柄
+    sampler_thread: Option<std::thread::JoinHandle<()>>,
+    /// 采样停止信号
+    sampler_stop: Option<Arc<AtomicBool>>,
+    /// 采样间隔（ms）
+    sampling_interval: u64,
 }
 
 impl JsonSession {
     /// 创建 JSON-Lines 会话
-    pub fn new(session: Session) -> Self {
-        Self { session }
+    pub fn new(session: Session, sampling_interval: u64, buffer_capacity: usize) -> Self {
+        Self {
+            session,
+            buffer: Arc::new(RwLock::new(DebugBuffer::new(buffer_capacity))),
+            sampler_thread: None,
+            sampler_stop: None,
+            sampling_interval,
+        }
     }
 
     /// 进入主协议循环
@@ -405,23 +492,45 @@ impl JsonSession {
     fn execute_json(&mut self, cmd: Command) -> anyhow::Result<Option<Value>> {
         match cmd {
             Command::Halt => {
-                self.session.backend.halt(None)?;
+                self.stop_sampler();
+                self.session.backend.lock().unwrap().halt(None)?;
                 self.session.state = SessionState::Halted;
                 Ok(Some(json!({"status": "halted"})))
             }
             Command::Resume => {
-                self.session.backend.resume(None)?;
+                self.session.backend.lock().unwrap().resume(None)?;
                 self.session.state = SessionState::Running;
-                Ok(Some(json!({"status": "running"})))
+                // 如果有 watch target，启动采样线程
+                let watch_count = self.buffer.read().unwrap().targets.len();
+                if watch_count > 0 {
+                    let backend = self.session.shared_backend();
+                    let buffer = self.buffer.clone();
+                    let mut sampler = Sampler::new(backend, buffer, self.sampling_interval, 0);
+                    let stop_flag = sampler.stop_flag();
+                    self.sampler_stop = Some(stop_flag);
+                    self.sampler_thread = Some(std::thread::spawn(move || {
+                        sampler.run();
+                    }));
+                }
+                Ok(Some(
+                    json!({"status": "running", "sampling": watch_count > 0, "sampling_interval_ms": self.sampling_interval}),
+                ))
             }
             Command::Step => {
-                self.session.backend.step(None)?;
-                let pc = self.session.backend.read_regs(None).ok().and_then(|regs| {
-                    regs.get("pc")
-                        .or_else(|| regs.get("PC"))
-                        .copied()
-                        .map(|v| v as u32)
-                });
+                self.session.backend.lock().unwrap().step(None)?;
+                let pc = self
+                    .session
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .read_regs(None)
+                    .ok()
+                    .and_then(|regs| {
+                        regs.get("pc")
+                            .or_else(|| regs.get("PC"))
+                            .copied()
+                            .map(|v| v as u32)
+                    });
                 self.session.state = SessionState::Halted;
                 self.session.pc = pc;
                 if let Some(pc) = pc {
@@ -431,12 +540,17 @@ impl JsonSession {
                 }
             }
             Command::Break { addr } => {
-                let id = self.session.backend.set_breakpoint(addr, None)?;
+                let id = self
+                    .session
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .set_breakpoint(addr, None)?;
                 self.session.bp_count += 1;
                 Ok(Some(json!({"bp_id": id, "addr": addr})))
             }
             Command::Regs => {
-                let regs = self.session.backend.read_regs(None)?;
+                let regs = self.session.backend.lock().unwrap().read_regs(None)?;
                 let mut map = serde_json::Map::new();
                 for (k, v) in &regs {
                     map.insert(k.clone(), json!(v));
@@ -444,7 +558,12 @@ impl JsonSession {
                 Ok(Some(Value::Object(map)))
             }
             Command::Mem { addr, len } => {
-                let data = self.session.backend.read_mem(addr, len, None)?;
+                let data = self
+                    .session
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .read_mem(addr, len, None)?;
                 Ok(Some(json!({"addr": addr, "len": len, "data": data})))
             }
             Command::Status => {
@@ -469,6 +588,8 @@ impl JsonSession {
                     "break <addr>, b   Set hardware breakpoint (halted)\n",
                     "regs, registers   Show core registers (halted)\n",
                     "mem <addr> <len>  Read memory (halted)\n",
+                    "watch <a>:<s>[:l] Add watch target (halted)\n",
+                    "buffer [--since N] Show sampling history\n",
                     "status, st        Show session status\n",
                     "help, h, ?        Show this help\n",
                     "quit, exit, q     Exit debug session",
@@ -476,6 +597,29 @@ impl JsonSession {
                 Ok(Some(json!({"help": help})))
             }
             Command::Quit => unreachable!(), // handled in handle_request
+            Command::Watch { addr, size, label } => {
+                let watch_id = self.buffer.write().unwrap().add_target(addr, size, label);
+                self.session.watch_count = self.buffer.read().unwrap().targets.len();
+                Ok(Some(
+                    json!({"watch_id": watch_id, "addr": addr, "size": size}),
+                ))
+            }
+            Command::Buffer { since, watch_id } => {
+                let samples = self.buffer.read().unwrap().get_samples(watch_id, since);
+                Ok(Some(
+                    json!({"samples": samples, "count": samples.iter().map(|v| v.len()).sum::<usize>()}),
+                ))
+            }
+        }
+    }
+
+    /// 停止采样线程
+    fn stop_sampler(&mut self) {
+        if let Some(stop) = self.sampler_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.sampler_thread.take() {
+            handle.join().ok();
         }
     }
 
@@ -484,25 +628,37 @@ impl JsonSession {
         if self.session.state != SessionState::Running {
             return;
         }
+        // 先获取 core 号，再一次性锁定 backend 检测 halt 状态
+        let active_core = self.session.backend.lock().unwrap().active_core();
         if !self
             .session
             .backend
-            .is_halted(Some(self.session.backend.active_core()))
+            .lock()
+            .unwrap()
+            .is_halted(Some(active_core))
         {
             return;
         }
         self.session.state = SessionState::Halted;
-        let pc = self.session.backend.read_regs(None).ok().and_then(|regs| {
-            regs.get("pc")
-                .or_else(|| regs.get("PC"))
-                .copied()
-                .map(|v| v as u32)
-        });
+        self.stop_sampler();
+        let pc = self
+            .session
+            .backend
+            .lock()
+            .unwrap()
+            .read_regs(None)
+            .ok()
+            .and_then(|regs| {
+                regs.get("pc")
+                    .or_else(|| regs.get("PC"))
+                    .copied()
+                    .map(|v| v as u32)
+            });
         let event = JsonEvent {
             event: "halted".into(),
             data: json!({
                 "pc": pc.unwrap_or(0),
-                "core": self.session.backend.active_core(),
+                "core": active_core,
             }),
         };
         Self::send_json(&event);
@@ -644,8 +800,8 @@ mod tests {
     #[test]
     fn test_schema_has_all_commands() {
         let schema = generate_schema();
-        // 10 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema
-        assert_eq!(schema.commands.len(), 10);
+        // 12 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer
+        assert_eq!(schema.commands.len(), 12);
     }
 
     #[test]

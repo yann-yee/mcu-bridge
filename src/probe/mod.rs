@@ -32,7 +32,7 @@ pub enum WatchKind {
 ///
 /// 所有方法均可失败返回 `anyhow::Error`。
 /// `core` 参数默认为 `None`（活跃核），显式传 `Some(n)` 指定目标核。
-pub trait DebugProbe {
+pub trait DebugProbe: Send {
     // ── 会话生命周期 ──
 
     /// 连接到目标芯片
@@ -103,5 +103,13 @@ pub trait DebugProbe {
     // ── 状态 ──
 
     /// 指定核是否处于 halted 状态
-    fn is_halted(&self, core: Option<usize>) -> bool;
+    fn is_halted(&mut self, core: Option<usize>) -> bool;
+
+    /// 轮询目标是否已 halt（更新内部缓存状态）。
+    ///
+    /// 默认实现直接返回 `is_halted()`。
+    /// probe-rs 后端在此方法中用 `wait_for_core_halted` 短超时轮询更新状态缓存。
+    fn poll_halted(&mut self, core: Option<usize>) -> bool {
+        self.is_halted(core)
+    }
 }

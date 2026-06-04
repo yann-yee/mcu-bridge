@@ -283,7 +283,7 @@ impl DebugProbe for OpenOcdBackend {
         anyhow::bail!("P2: OpenOCD read_regs not implemented")
     }
 
-    fn is_halted(&self, _core: Option<usize>) -> bool {
+    fn is_halted(&mut self, _core: Option<usize>) -> bool {
         false
     }
 }
