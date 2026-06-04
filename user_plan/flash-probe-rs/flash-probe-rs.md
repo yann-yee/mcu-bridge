@@ -160,11 +160,11 @@ fn handle(args: &FlashArgs) -> anyhow::Result<()> {
 
 > 绝对禁止空洞通过。以下每条都必须通过命令验证。
 
-- [ ] **1. 编译断言**: `cargo check` 零 error 零 warning（不含 `dead_code`——P2 模块的 `#![allow(dead_code)]` 仍存在）。
-- [ ] **2. fmt 断言**: `cargo fmt --all -- --check` 零差异。
-- [ ] **3. 无硬件 dry-run 测试（ELF 不存在）**: `cargo run -- flash --elf nonexistent.elf --chip STM32F407VG` → stderr 含 `"ELF file not found"`，exit code ≠ 0。
-- [ ] **4. 无硬件 dry-run 测试（芯片模板不存在）**: `cargo run -- flash --elf Cargo.toml --chip INVALID_CHIP` → stderr 含 `"unknown chip"`，exit code ≠ 0。
-- [ ] **5. 无硬件 dry-run 测试（无配置无参数）**: `cargo run -- flash --elf Cargo.toml`（无 `--chip`、无 `.debugger/chip.toml`）→ 报错提示需要 chip。
-- [ ] **6. 单元测试继续通过**: `cargo test --lib` 10 个测试全部绿色。
-- [ ] **7. CLI 参数断言**: `cargo run -- flash --help` 输出中包含 `--run`、`--verify`、`--chip`、`--elf`、`--no-verify`。
+- [x] **1. 编译断言**: `cargo check` 零 error 零 warning（不含 `dead_code`——P2 模块的 `#![allow(dead_code)]` 仍存在）。
+- [x] **2. fmt 断言**: `cargo fmt --all -- --check` 零差异。
+- [x] **3. 无硬件 dry-run 测试（ELF 不存在）**: `cargo run -- flash --elf nonexistent.elf --chip STM32F407VG` → stderr 含 `"ELF file not found"`，exit code ≠ 0。
+- [x] **4. 无硬件 dry-run 测试（芯片模板不存在）**: `cargo run -- flash --elf Cargo.toml --chip INVALID_CHIP` → stderr 含 `"unknown chip"`，exit code ≠ 0。
+- [x] **5. 无硬件 dry-run 测试（无配置无参数）**: `cargo run -- flash --elf Cargo.toml`（无 `--chip`、无 `.debugger/chip.toml`）→ 报错提示需要 chip。
+- [x] **6. 单元测试继续通过**: `cargo test --lib` 10 个测试全部绿色。
+- [x] **7. CLI 参数断言**: `cargo run -- flash --help` 输出中包含 `--run`、`--verify`、`--chip`、`--elf`、`--no-verify`。
 - [ ] **8. 真实硬件集成测试（手动/CI）**: 连接 STM32F407VG + ST-Link，`cargo run -- flash --elf firmware.elf --chip STM32F407VG --run` → 烧录成功，芯片自动运行新固件。

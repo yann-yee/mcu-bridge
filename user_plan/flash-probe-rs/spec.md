@@ -51,9 +51,9 @@
 
 任何编码结果在被标记为完成提交至 Pull Request 前，执行 Agent 必须完成以下自检：
 
-- [ ] 没有任何 `// TODO`、`todo!()` 残留于 `[src/cli/flash.rs](src/cli/flash.rs)`。
-- [ ] 确实在本地运行了 `cargo check`，不存在任何静态或类型报错。
-- [ ] 运行 `cargo fmt --all -- --check`，无格式差异。
-- [ ] 运行 `cargo test --lib`，全部测试通过。
-- [ ] 运行 `cargo clippy --all-targets --all-features -- -D warnings`（若 clippy-driver 可用），无 warning。
-- [ ] 运行 `git diff` 核实改动面积，100% 契合 [task.md](task.md) 规定的 4 个文件（`src/cli/mod.rs`、`src/cli/flash.rs`、`src/cli/init.rs`、`src/main.rs`），无出轨改动。
+- [x] 没有任何 `// TODO`、`todo!()` 残留于 `[src/cli/flash.rs](src/cli/flash.rs)`。
+- [x] 确实在本地运行了 `cargo check`，不存在任何静态或类型报错。
+- [x] 运行 `cargo fmt --all -- --check`，无格式差异。
+- [x] 运行 `cargo test --lib`，全部测试通过。
+- [x] 运行 `cargo clippy --all-targets --all-features -- -D warnings`（若 clippy-driver 可用），无 warning。
+- [x] 运行 `git diff` 核实改动面积，100% 契合 [task.md](task.md) 规定的 4 个文件（`src/cli/mod.rs`、`src/cli/flash.rs`、`src/cli/init.rs`、`src/main.rs`），无出轨改动。
