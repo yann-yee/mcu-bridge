@@ -35,7 +35,10 @@ fn load_config_from_dot_debugger() -> anyhow::Result<AppConfig> {
 /// 解析芯片配置（CLI 参数优先，否则读取配置文件）。
 fn resolve_chip_config(chip_arg: Option<&str>) -> anyhow::Result<(ChipConfig, FlashOpts)> {
     if let Some(name) = chip_arg {
-        let chip = init::get_chip_template(name)?;
+        // 先用模板校验芯片存在并获取架构信息
+        let mut chip = init::get_chip_template(name)?;
+        // 用用户输入的精确芯片名（probe-rs 需要精确的 target 名称）
+        chip.name = name.to_string();
         let opts = FlashOpts {
             base: chip.flash_base,
             size: chip.flash_size,

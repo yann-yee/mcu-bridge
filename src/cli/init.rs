@@ -28,7 +28,18 @@ pub(crate) fn get_chip_template(name: &str) -> anyhow::Result<ChipConfig> {
             ram_base: 0x2000_0000,
             ram_size: 0x0002_0000, // 128KB
         }),
-        unknown => anyhow::bail!("unknown chip '{}'. Available: STM32F407VG", unknown),
+        "STM32F411" | "STM32F411VE" | "STM32F411RE" => Ok(ChipConfig {
+            name: "STM32F411RE".into(),
+            architecture: "cortex-m4".into(),
+            flash_base: 0x0800_0000,
+            flash_size: 0x0008_0000, // 512KB
+            ram_base: 0x2000_0000,
+            ram_size: 0x0002_0000, // 128KB
+        }),
+        unknown => anyhow::bail!(
+            "unknown chip '{}'. Available: STM32F407VG, STM32F411(RE)",
+            unknown
+        ),
     }
 }
 

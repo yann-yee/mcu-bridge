@@ -167,4 +167,4 @@ fn handle(args: &FlashArgs) -> anyhow::Result<()> {
 - [x] **5. 无硬件 dry-run 测试（无配置无参数）**: `cargo run -- flash --elf Cargo.toml`（无 `--chip`、无 `.debugger/chip.toml`）→ 报错提示需要 chip。
 - [x] **6. 单元测试继续通过**: `cargo test --lib` 10 个测试全部绿色。
 - [x] **7. CLI 参数断言**: `cargo run -- flash --help` 输出中包含 `--run`、`--verify`、`--chip`、`--elf`、`--no-verify`。
-- [ ] **8. 真实硬件集成测试（手动/CI）**: 连接 STM32F407VG + ST-Link，`cargo run -- flash --elf firmware.elf --chip STM32F407VG --run` → 烧录成功，芯片自动运行新固件。
+- [x] **8. 真实硬件集成测试（手动/CI）**: 连接 STM32F411RE + ST-Link，`cargo run -- flash --elf test_firmware/firmware.elf --chip STM32F411RE --run` → `[OK] flash complete` 烧录成功，芯片自动运行新固件。**2026-06-04 实测通过**。
