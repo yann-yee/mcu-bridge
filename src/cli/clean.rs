@@ -75,13 +75,12 @@ pub fn handle(args: &CleanArgs) -> anyhow::Result<()> {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let meta = entry.metadata()?;
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(elapsed) = now.duration_since(modified) {
-                        if elapsed > threshold {
-                            fs::remove_dir_all(entry.path())?;
-                            removed += 1;
-                        }
-                    }
+                if let Ok(modified) = meta.modified()
+                    && let Ok(elapsed) = now.duration_since(modified)
+                    && elapsed > threshold
+                {
+                    fs::remove_dir_all(entry.path())?;
+                    removed += 1;
                 }
             }
         }

@@ -8,69 +8,69 @@ use thiserror::Error;
 pub enum McuBridgeError {
     /// 命令在当前目标状态下不可用
     #[error("command not valid in current target state")]
-    EState,
+    State,
 
     /// 参数无效或缺失
     #[error("invalid or missing parameter")]
-    EParam,
+    Param,
 
     /// 后端通信失败
     #[error("backend communication failure")]
-    EBackend,
+    Backend,
 
     /// 探针断连，恢复中
     #[error("probe disconnected, recovery in progress")]
-    EProbe,
+    Probe,
 
     /// 探针恢复失败，会话即将结束
     #[error("probe recovery failed, session ending")]
-    EProbeLost,
+    ProbeLost,
 
     /// Flash 操作失败
     #[error("flash operation failed")]
-    EFlash,
+    Flash,
 
     /// 需要 DWARF 信息但不可用
     #[error("DWARF info needed but not available")]
-    ENoDwarf,
+    NoDwarf,
 
     /// 操作在 semihosting 模式下不支持
     #[error("operation not supported in semihosting mode")]
-    ENoSemihosting,
+    NoSemihosting,
 
     /// Flash 断点未启用
     #[error("flash breakpoints not enabled")]
-    EFlashBpDisabled,
+    FlashBpDisabled,
 
     /// Flash 断点会话次数已达上限
     #[error("flash breakpoint session limit reached")]
-    EFlashBpLimit,
+    FlashBpLimit,
 
     /// 串口操作失败
     #[error("serial port operation failed")]
-    ESerial,
+    Serial,
 
     /// 内部错误
     #[error("internal error")]
-    EInternal,
+    Internal,
 }
 
 impl McuBridgeError {
     /// 返回 JSON-Lines 协议中对应的错误码字符串。
     pub fn code(&self) -> &'static str {
         match self {
-            Self::EState => "E_STATE",
-            Self::EParam => "E_PARAM",
-            Self::EBackend => "E_BACKEND",
-            Self::EProbe => "E_PROBE",
-            Self::EProbeLost => "E_PROBE_LOST",
-            Self::EFlash => "E_FLASH",
-            Self::ENoDwarf => "E_NO_DWARF",
-            Self::ENoSemihosting => "E_NO_SEMIHOSTING",
-            Self::EFlashBpDisabled => "E_FLASH_BP_DISABLED",
-            Self::EFlashBpLimit => "E_FLASH_BP_LIMIT",
-            Self::ESerial => "E_SERIAL",
-            Self::EInternal => "E_INTERNAL",
+            Self::State => "E_STATE",
+            Self::Param => "E_PARAM",
+            Self::Backend => "E_BACKEND",
+            Self::Probe => "E_PROBE",
+            Self::ProbeLost => "E_PROBE_LOST",
+            Self::Flash => "E_FLASH",
+            Self::NoDwarf => "E_NO_DWARF",
+            Self::NoSemihosting => "E_NO_SEMIHOSTING",
+            Self::FlashBpDisabled => "E_FLASH_BP_DISABLED",
+            Self::FlashBpLimit => "E_FLASH_BP_LIMIT",
+            Self::Serial => "E_SERIAL",
+            Self::Internal => "E_INTERNAL",
         }
     }
 }
