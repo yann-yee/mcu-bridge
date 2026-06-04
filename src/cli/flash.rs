@@ -88,7 +88,8 @@ pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{FlashArgs, handle};
+    use std::path::PathBuf;
 
     #[test]
     fn test_flash_elf_not_found() {

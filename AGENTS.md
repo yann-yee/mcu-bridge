@@ -27,6 +27,11 @@
 - **局部性原理**: 永远保持改动的局部性，避免为了解决一个微小的局部命名，产生全系统范围的大重构（除非用户明确发出重构指令）。
 - **trait 变更审查**: 对 `DebugProbe`、`LogChannel` 这两个核心 trait 的任何签名修改，必须在改动前列出所有受影响的 implementor（probe-rs backend、OpenOCD backend、RttChannel、UartChannel、SemihostingChannel），确保全部同步更新。
 
+### 4. 用户审批权原则 (User Approval for Side-Effects)
+
+- **禁止擅自提交**: 在将任何代码变更通过 `git commit` + `git push` 提交到远程仓库之前，必须先向用户展示完整的变更清单并请求明确许可。只有当用户回复"可以提交"、"提交吧"或等效批准后，方可执行提交操作。这一约束适用于所有产生网络/CI 副作用的操作（包括但不限于 `git push`、`cargo publish`、GitHub Actions 触发等）。
+- **集中变更原则**: 同一功能的多个改动应合并为少数几个逻辑提交（理想情况下 1 个），避免零散提交浪费 CI 资源。不应出现"修 A → 推 → 修 B → 推 → 修 C → 推"的碎步模式。
+
 ---
 
 ## 二、 项目约束 (Project Constraints)
@@ -62,6 +67,8 @@
 - **probe-rs API 侦察策略** `[← archive/p0-probe-cli 经验]`: probe-rs 0.31 的公开 API 与其内部模块结构不完全对应——`SessionConfig`/`Permissions`/`Session` 从 `probe_rs::` 直接裸出而非 `probe_rs::session::XXX`，`Core` 的方法 `halt`/`run`/`step` 是 `CoreInterface` trait 方法需 trait 在作用域内，`read_word_32`/`write_word_32` 需 `use probe_rs::MemoryInterface`。**禁止在写实现代码前花大量时间 grep probe-rs 源码**——相反，先写出符合设计文档预期的调用代码，用 `cargo check` 编译，让编译器给出精确的 API 修正提示。每轮 `cargo check` 修复 3-5 个错误，2-3 轮即可收敛。这比提前翻阅源码效率高一个数量级。
 
 - **Rust 借用检查器与 set_breakpoint 模式** `[← archive/p0-probe-cli 经验]`: 当 `DebugProbe` 方法需要同时操作内部状态（如 `bp_map`）和借出 `Core` 时，必须遵循「先修改 self、再借出子对象」的顺序。`get_core()` 返回拥有型 `Core` 后，编译器禁止再访问 `self.next_bp_id`。**标准模式**：先分配 ID/修改计数器/插入 map → 再调用 `self.get_core()` 获取 core → 操作硬件 → 失败时回滚前面已修改的 self 状态。不允许「先借 core、后改 self」的写法。
+
+- **probe-rs 芯片名精确性** `[← archive/flash-probe-rs 经验]`: probe-rs 的 `Session::auto_attach()` 要求芯片名称与其内部 target 数据库完全一致——`"STM32F411RE"` 可识别但 `"STM32F411"` 会报 `"Unable to load specification for chip"`。芯片模板的 `name` 字段必须使用 probe-rs 能识别的精确 target 名称。当用户通过 `--chip` 传入名称时，应透传原始输入值给 probe-rs，模板仅用于校验芯片存在性和提供架构参数（Flash/RAM 地址）。
 
 - **Cargo.lock 提交规范** `[← archive/ci-cd 经验]`: 二进制项目（`[[bin]]`）的 `Cargo.lock` **必须提交到版本控制**。CI 中 `Swatinem/rust-cache` 的缓存 key 基于 `Cargo.lock` hash——如果 lock 文件未提交，CI 每次运行 `cargo generate-lockfile` 都可能产生不同的 hash 导致缓存永不命中。任何删除 `.gitignore` 中的 `Cargo.lock` 过滤或 `.gitignore` 中遗漏 `Cargo.lock` 的情况，必须在首次 CI 配置时一并修复。
 
