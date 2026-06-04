@@ -8,22 +8,22 @@
 
 - **源需求文档**: [user_plan/debug-round2/debug-round2.md](debug-round2.md)
 - **最新更新日期**: 2026-06-06
-- **整体进度状态**: `not-started`
+- **整体进度状态**: `completed`
 
 ---
 
 ## 一、 开发准备与依赖准备 (Preparation)
 
-- [ ] **Task 1.1: 确认项目基线状态**
+- [x] **Task 1.1: 确认项目基线状态**
   - **描述**: 确保当前项目在改动前所有测试通过、编译通过。
   - **本地验证命令**: `cargo test -- --skip test_attach_without_hardware && cargo fmt --all -- --check && cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
 ---
 
 ## 二、 基础设施层改动 (Session + Module Registration)
 
-- [ ] **Task 2.1: 修改 `Session::attach()` 签名 — 接受外部 backend 注入**
+- [x] **Task 2.1: 修改 `Session::attach()` 签名 — 接受外部 backend 注入**
   - **受影响文件**: `[src/session.rs](../../src/session.rs)`
   - **函数级实施计划**:
     1. 将 `pub fn attach(chip: &ChipConfig) -> anyhow::Result<Self>` 改为 `pub fn attach(chip: &ChipConfig, backend: Box<dyn DebugProbe>) -> anyhow::Result<Self>`
@@ -33,20 +33,20 @@
     5. 保留 `Session::new(chip_name: String)`（标记 `#[deprecated]` 不变）
     6. 保留 `impl Default for Session`（不变）
   - **本地验证命令**: `cargo check`（会揭示所有调用 `Session::attach` 的地方需要同步更新）
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 2.2: 注册 `json_session` 模块**
+- [x] **Task 2.2: 注册 `json_session` 模块**
   - **受影响文件**: `[src/cli/mod.rs](../../src/cli/mod.rs)`
   - **实施计划**:
     1. 在 `pub mod init;` 之后添加一行 `pub mod json_session;`
   - **本地验证命令**: `cargo check`（会提示尚未实现的模块，正常）
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
 ---
 
 ## 三、 CLI 启动集成 — handle() 改造 (Phase 2)
 
-- [ ] **Task 3.1: 在 `debug.rs` 中新增 `create_debug_backend()` 工厂函数**
+- [x] **Task 3.1: 在 `debug.rs` 中新增 `create_debug_backend()` 工厂函数**
   - **受影响文件**: `[src/cli/debug.rs](../../src/cli/debug.rs)`
   - **函数级实施计划**:
     1. 新增 `use crate::probe::openocd::OpenOcdBackend;` 导入
@@ -56,9 +56,9 @@
     5. openocd 分支：先尝试 `.debugger/openocd.cfg`，如果存在则用该路径创建 `OpenOcdBackend`，否则报错
     6. 未知后端：`anyhow::bail!("unknown backend '{}'. Supported: probe-rs, openocd", backend_type)`
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 3.2: 新增 `resolve_chip_and_flash_opts()` 辅助函数**
+- [x] **Task 3.2: 新增 `resolve_chip_and_flash_opts()` 辅助函数**
   - **受影响文件**: `[src/cli/debug.rs](../../src/cli/debug.rs)`
   - **函数级实施计划**:
     1. 新增函数：`fn resolve_chip_and_flash_opts(chip_arg: &Option<String>) -> anyhow::Result<(ChipConfig, FlashOpts)>`
@@ -66,9 +66,9 @@
     3. 构造 `FlashOpts`（与 `flash.rs` 中的 `resolve_chip_config` 类似）
     4. 引入 `use crate::config::FlashOpts;`（如果未引入）
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 3.3: 改造 `handle()` 函数 — 补齐启动流程**
+- [x] **Task 3.3: 改造 `handle()` 函数 — 补齐启动流程**
   - **受影响文件**: `[src/cli/debug.rs](../../src/cli/debug.rs)`
   - **函数级实施计划**:
     1. 将现有 `let chip = resolve_chip_for_debug(&args.chip)?;` 替换为 `let (chip, flash_opts) = resolve_chip_and_flash_opts(&args.chip)?;`
@@ -83,22 +83,22 @@
     6. 路由到对应界面：`if args.json { ... JsonSession::new(session).run()? } else { ... DebugRepl::new(session).run()? }`
     7. 删除 `// TODO: Round 2 — 处理以下参数` 注释块
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 3.4: 调整 `DebugRepl::new()` 和 `Session::attach` 的调用关系以适配新签名**
+- [x] **Task 3.4: 调整 `DebugRepl::new()` 和 `Session::attach` 的调用关系以适配新签名**
   - **受影响文件**: `[src/cli/debug.rs](../../src/cli/debug.rs)`
   - **实施计划**:
     1. 确保 `handle()` 中的 `Session::attach(&chip, backend)` 传入了正确的 backend
     2. 确认 `DebugRepl::new(session)` 不改动 — `DebugRepl` 结构体不变
   - **注意**: `DebugRepl::new()` 的 `session: Session` 参数不变，不影响
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
 ---
 
 ## 四、 Agent JSON-Lines 模式 — JsonSession (Phase 3 + Phase 4)
 
-- [ ] **Task 4.1: 创建 `src/cli/json_session.rs` — 协议类型定义**
+- [x] **Task 4.1: 创建 `src/cli/json_session.rs` — 协议类型定义**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. 新建文件，模块声明：`use` std / serde / serde_json / crate 相关
@@ -107,9 +107,9 @@
     4. 定义 `JsonResponse`：`#[derive(Serialize)] struct JsonResponse { id: u64, status: String, data: Option<Value>, error: Option<JsonError> }`
     5. 定义 `JsonEvent`：`#[derive(Serialize)] struct JsonEvent { event: String, data: Value }`
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 4.2: 实现 `JsonSession` 结构体和 `run()` 主循环**
+- [x] **Task 4.2: 实现 `JsonSession` 结构体和 `run()` 主循环**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. `pub struct JsonSession { session: Session }`
@@ -132,9 +132,9 @@
        self.session.detach()?;
        ```
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 4.3: 实现 `read_request()` 和 `send_response()` / `send_event()`**
+- [x] **Task 4.3: 实现 `read_request()` 和 `send_response()` / `send_event()`**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. `fn read_request() -> Option<JsonRequest>`：从 stdin 读取一行 → `serde_json::from_str` → 解析失败时 send E_PARAM 并返回 None
@@ -142,9 +142,9 @@
     3. `fn send_event(event: &str, data: Value)`：序列化 `JsonEvent` → println! 到 stdout
     4. 所有 stdio 操作使用 `std::io::stdin().lines()` 和 `println!`
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 4.4: 实现 `json_to_command()` — JSON 请求到 `Command` 映射**
+- [x] **Task 4.4: 实现 `json_to_command()` — JSON 请求到 `Command` 映射**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. 新增函数 `fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse>`
@@ -157,9 +157,9 @@
     3. 参数缺失 → `E_PARAM`
     4. 参数类型错误 → `E_PARAM`
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 4.5: 实现 `Schema` 生成函数**
+- [x] **Task 4.5: 实现 `Schema` 生成函数**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. 定义 `CommandMeta` 结构体（serde Serialize）：name / description / args / valid_states
@@ -169,9 +169,9 @@
     5. 包含 12 个错误码映射（从 `McuBridgeError` 的 code() 方法获取）
     6. schema 响应格式：`{"id":0,"status":"ok","data":{commands:[...],error_codes:{...}}}`
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 4.6: 实现事件检测方法 `try_check_halted()`**
+- [x] **Task 4.6: 实现事件检测方法 `try_check_halted()`**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`
   - **函数级实施计划**:
     1. `fn try_check_halted(&mut self) -> bool`：尝试调用 `self.session.backend.is_halted(Some(self.session.backend.active_core()))`
@@ -183,13 +183,13 @@
     3. 如果 `is_halted` 调用失败（探针断连），返回 false（主循环会优雅处理）
     4. 注意：`is_halted()` 当前在 `ProbeRsBackend` 中是 stub（返回 false）。但这不影响架构——事件检测逻辑已就位，待 P2 实现真实的 `is_halted` 后自动生效。
   - **本地验证命令**: `cargo check`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
 ---
 
 ## 五、 测试编写 (Test Coverage)
 
-- [ ] **Task 5.1: 更新 `session.rs` 测试 — 适配新 `attach()` 签名**
+- [x] **Task 5.1: 更新 `session.rs` 测试 — 适配新 `attach()` 签名**
   - **受影响文件**: `[src/session.rs](../../src/session.rs)`（测试模块）
   - **实施计划**:
     1. 如果 `session.rs` 的 `#[cfg(test)]` 模块中有测试直接调用 `Session::attach(&chip)`，改为 `Session::attach(&chip, backend)`，传入 mock backend
@@ -197,9 +197,9 @@
   - **注意**: `Session` 当前没有 `#[cfg(test)]` 模块（测试在 `debug.rs` 中）。可能不需要改动。
   - **确认**: 检查 `session.rs` 是否有测试代码
   - **本地验证命令**: `cargo test -- --skip test_attach_without_hardware`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 5.2: 新增 JSON-Lines 协议测试**
+- [x] **Task 5.2: 新增 JSON-Lines 协议测试**
   - **受影响文件**: `[src/cli/json_session.rs](../../src/cli/json_session.rs)`（测试模块）
   - **函数级实施计划**:
     1. 在文件末尾添加 `#[cfg(test)] mod tests { ... }`
@@ -211,9 +211,9 @@
     7. 测试 6 `test_schema_has_error_codes`：schema 包含全部 12 个错误码
     8. 测试 7 `test_event_halted_format`：构造 `JsonEvent` → 序列化为 `{"event":"halted","data":{"pc":134219776}}`
   - **本地验证命令**: `cargo test -- --skip test_attach_without_hardware`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 5.3: 新增 CLI 启动流程测试**
+- [x] **Task 5.3: 新增 CLI 启动流程测试**
   - **受影响文件**: `[src/cli/debug.rs](../../src/cli/debug.rs)`（现有测试模块）
   - **函数级实施计划**:
     1. 在现有 `mod tests` 中添加以下测试：
@@ -221,24 +221,24 @@
     3. `test_handle_backend_openocd_no_cfg`：`create_debug_backend(&Some("openocd".into()))` 在无 `.debugger/openocd.cfg` 时报错
     4. `test_handle_backend_unknown`：`create_debug_backend(&Some("invalid".into()))` 报 "unknown backend"
   - **本地验证命令**: `cargo test -- --skip test_attach_without_hardware`
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
 ---
 
 ## 六、 全局集成检验与 DoD 验证 (Whole Loop Verification)
 
-- [ ] **Task 6.1: 全量测试 + fmt + clippy 验证**
+- [x] **Task 6.1: 全量测试 + fmt + clippy 验证**
   - **描述**: 运行完整功能链，断言满足 DoD 指标。
   - **执行命令**:
     1. `cargo test -- --skip test_attach_without_hardware` — 全部通过
     2. `cargo fmt --all -- --check` — 零差异
     3. `cargo clippy --all-targets --all-features -- -D warnings` — 零警告
     4. `cargo check` — 编译通过
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
 
-- [ ] **Task 6.2: context.md 与归档**
+- [x] **Task 6.2: context.md 与归档**
   - **描述**: 如有新知识反哺 context.md，执行 Archive-and-Summary。
   - **实施计划**:
     1. 评估是否需要更新 context.md（新术语/决策？— JsonSession、JSON-Lines 事件推送、混合模式协议已是共识）
     2. 执行 `archive-and-summary debug-round2` 归档
-  - **当前状态**: `not-started`
+  - **当前状态**: `completed`
