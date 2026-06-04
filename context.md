@@ -145,6 +145,8 @@
 ## 五、 上下文维护与变更日志 (Maintenance History)
 
 > 任何人（含 Agent 与人类用户）只要修改了本文件，必须在此按时间倒序追加一条变更声明。
+>
+> **写入规则**: 仅在有新的共享知识产生时追加（新术语、新架构决策、新排除范围）。单纯的 bug 修复、特性实现、重构等 git 已经记录的变更——不需要在 context.md 中重复登记。context.md 的变更日志仅记录**影响 Glossary、架构决策、Non-Goals 的知识级变更**。
 
 - **[2026-06-03]**: 归档 ci-cd 需求。验收通过：ci.yml 三平台 matrix（Linux/Win/macOS）+ Swatinem/rust-cache@v2 + release.yml tag 自动发布 + Cargo.lock 生成。提炼 2 条刺卡经验反哺 AGENTS.md：(1) 二进制项目的 Cargo.lock 必须提交以保障 CI 缓存命中率；(2) upload-artifact/download-artifact 跨 job 传递多平台二进制模式。目录已归档至 [user_plan/archive/ci-cd/](user_plan/archive/ci-cd/)。(By Agent - Archive-and-Summary)
 - **[2026-06-03]**: 归档 P0 (p0-probe-cli)。验收通过：probe-rs backend 12 方法实现（attach/detach/flash/halt/resume/step/core_count/active_core/set_breakpoint/clear_breakpoint/read_mem/write_mem/read_regs）+ CLI init/clean/flash 三子命令 + 10 mock 测试全绿 + cargo check/fmt/test 全量通过。提炼 2 条刺卡经验反哺 AGENTS.md：(1) probe-rs API 侦察策略——让编译器给出修正提示而非提前 grep 源码；(2) Rust 借用检查器模式——先改 self 再借子对象。目录已归档至 [user_plan/archive/p0-probe-cli/](user_plan/archive/p0-probe-cli/)。(By Agent - Archive-and-Summary)

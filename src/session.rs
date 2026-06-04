@@ -6,7 +6,6 @@ use log::info;
 
 use crate::config::ChipConfig;
 use crate::probe::DebugProbe;
-use crate::probe::probe_rs::ProbeRsBackend;
 
 /// 会话状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +38,10 @@ pub struct Session {
 
 impl Session {
     /// 连接探针并创建会话（初始状态 Halted）。
-    pub fn attach(chip: &ChipConfig) -> anyhow::Result<Self> {
-        let mut backend = ProbeRsBackend::new();
+    ///
+    /// 调用方负责创建并传入 `backend`，可注入 mock 便于测试。
+    pub fn attach(chip: &ChipConfig, backend: Box<dyn DebugProbe>) -> anyhow::Result<Self> {
+        let mut backend = backend;
         backend.attach(chip)?;
         let core_count = backend.core_count();
         info!("session attached to {} ({} core(s))", chip.name, core_count);
@@ -51,7 +52,7 @@ impl Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend: Box::new(backend),
+            backend,
         })
     }
 
@@ -75,7 +76,7 @@ impl Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend: Box::new(ProbeRsBackend::new()),
+            backend: Box::new(crate::probe::probe_rs::ProbeRsBackend::new()),
         }
     }
 }
@@ -89,7 +90,7 @@ impl Default for Session {
             pc: None,
             bp_count: 0,
             watch_count: 0,
-            backend: Box::new(ProbeRsBackend::new()),
+            backend: Box::new(crate::probe::probe_rs::ProbeRsBackend::new()),
         }
     }
 }

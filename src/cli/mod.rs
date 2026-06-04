@@ -9,6 +9,7 @@ pub mod clean;
 pub mod debug;
 pub mod flash;
 pub mod init;
+pub mod json_session;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
