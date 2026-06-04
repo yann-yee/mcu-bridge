@@ -97,10 +97,10 @@ impl fmt::Display for Command {
             Self::Buffer { since, watch_id } => {
                 write!(f, "buffer")?;
                 if let Some(s) = since {
-                    write!(f, " --since {s}")?;
+                    write!(f, " {s}")?;
                 }
                 if let Some(w) = watch_id {
-                    write!(f, " --watch {w}")?;
+                    write!(f, " {w}")?;
                 }
                 Ok(())
             }
@@ -191,33 +191,24 @@ impl Command {
                 Ok(Self::Watch { addr, size, label })
             }
             "buffer" | "buff" => {
-                let mut since = None;
-                let mut watch_id = None;
-                let mut i = 1;
-                while i < parts.len() {
-                    match parts[i] {
-                        "--since" => {
-                            i += 1;
-                            if i >= parts.len() {
-                                return Err("usage: buffer --since <sn>".into());
-                            }
-                            since = Some(parts[i].parse::<u64>().map_err(|_| {
-                                format!("invalid sn: '{}'. Use decimal.", parts[i])
-                            })?);
-                        }
-                        "--watch" => {
-                            i += 1;
-                            if i >= parts.len() {
-                                return Err("usage: buffer --watch <id>".into());
-                            }
-                            watch_id = Some(parts[i].parse::<usize>().map_err(|_| {
-                                format!("invalid watch id: '{}'. Use decimal.", parts[i])
-                            })?);
-                        }
-                        _ => return Err(format!("unknown option: '{}'", parts[i])),
-                    }
-                    i += 1;
-                }
+                // positional: buffer [since] [watch_id]
+                let since = if parts.len() > 1 {
+                    Some(
+                        parts[1]
+                            .parse::<u64>()
+                            .map_err(|_| format!("invalid sn: '{}'. Use decimal.", parts[1]))?,
+                    )
+                } else {
+                    None
+                };
+                let watch_id =
+                    if parts.len() > 2 {
+                        Some(parts[2].parse::<usize>().map_err(|_| {
+                            format!("invalid watch id: '{}'. Use decimal.", parts[2])
+                        })?)
+                    } else {
+                        None
+                    };
                 Ok(Self::Buffer { since, watch_id })
             }
             _ => Err(format!(
@@ -407,13 +398,23 @@ impl DebugRepl {
         Ok(())
     }
 
-    /// 停止采样线程
+    /// 停止采样线程（最多等待 2 秒，超时则分离线程不阻塞主线程）。
     fn stop_sampler(&mut self) {
         if let Some(stop) = self.sampler_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(handle) = self.sampler_thread.take() {
-            handle.join().ok();
+            // 等最多 2s 让采样线程看到 stop_flag 并退出
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // 超时：分离线程（采样卡在 read_mem 硬件超时中），不阻塞主线程
+            // JoinHandle drop → 线程被分离，它会在 http 下回归
         }
     }
 
@@ -592,7 +593,7 @@ impl DebugRepl {
         println!("  regs, registers   Show core registers (halted)");
         println!("  mem <addr> <len>  Read memory (halted)");
         println!("  watch <a>:<s>[:l] Add watch target, e.g. 0x20000000:4:counter (halted)");
-        println!("  buffer [--since N] Show sampling history");
+        println!("  buffer [since] [watch_id] Show sampling history");
         println!("  status, st        Show session status");
         println!("  help, h, ?        Show this help");
         println!("  quit, exit, q     Exit debug session");

@@ -612,7 +612,7 @@ impl JsonSession {
                     "regs, registers   Show core registers (halted)\n",
                     "mem <addr> <len>  Read memory (halted)\n",
                     "watch <a>:<s>[:l] Add watch target (halted)\n",
-                    "buffer [--since N] Show sampling history\n",
+                    "buffer [since] [watch_id] Show sampling history\n",
                     "status, st        Show session status\n",
                     "help, h, ?        Show this help\n",
                     "quit, exit, q     Exit debug session",
@@ -636,13 +636,21 @@ impl JsonSession {
         }
     }
 
-    /// 停止采样线程
+    /// 停止采样线程（最多等待 2 秒，超时则分离线程不阻塞主线程）。
     fn stop_sampler(&mut self) {
         if let Some(stop) = self.sampler_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(handle) = self.sampler_thread.take() {
-            handle.join().ok();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // 超时 → 分离
         }
     }
 
