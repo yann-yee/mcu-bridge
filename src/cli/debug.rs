@@ -202,14 +202,14 @@ impl DebugRepl {
                 Some(Command::Quit) => break,
                 Some(cmd) => {
                     // 状态守卫
-                    if let Some(states) = cmd.valid_states() {
-                        if !states.contains(&self.session.state) {
-                            println!(
-                                "[ERROR] command '{cmd}' not valid in {:?} state",
-                                self.session.state
-                            );
-                            continue;
-                        }
+                    if let Some(states) = cmd.valid_states()
+                        && !states.contains(&self.session.state)
+                    {
+                        println!(
+                            "[ERROR] command '{cmd}' not valid in {:?} state",
+                            self.session.state
+                        );
+                        continue;
                     }
                     // 执行
                     if let Err(e) = self.execute(cmd) {
@@ -401,7 +401,7 @@ impl DebugRepl {
 }
 
 /// 解析芯片配置（CLI 参数优先，否则尝试 .debugger/chip.toml）。
-fn resolve_chip_for_debug<'a>(chip_arg: &'a Option<String>) -> anyhow::Result<ChipConfig> {
+fn resolve_chip_for_debug(chip_arg: &Option<String>) -> anyhow::Result<ChipConfig> {
     match chip_arg {
         Some(name) => {
             let mut chip = init::get_chip_template(name)?;
