@@ -267,7 +267,7 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
         "status" => Ok(Command::Status),
         "help" => Ok(Command::Help),
         "quit" => Ok(Command::Quit),
-        "schema" => Ok(Command::Status), // 占位，实际在 handler 中特殊处理
+        "schema" => unreachable!(), // handled in handle_request before json_to_command
         unknown => Err(err_response(
             "E_PARAM",
             format!("unknown command '{}'", unknown),
@@ -484,39 +484,37 @@ impl JsonSession {
         if self.session.state != SessionState::Running {
             return;
         }
-        let is_halted = match self
+        if !self
             .session
             .backend
             .is_halted(Some(self.session.backend.active_core()))
         {
-            true => true,
-            false => return,
-        };
-        if is_halted {
-            self.session.state = SessionState::Halted;
-            let pc = self.session.backend.read_regs(None).ok().and_then(|regs| {
-                regs.get("pc")
-                    .or_else(|| regs.get("PC"))
-                    .copied()
-                    .map(|v| v as u32)
-            });
-            let event = JsonEvent {
-                event: "halted".into(),
-                data: json!({
-                    "pc": pc.unwrap_or(0),
-                    "core": self.session.backend.active_core(),
-                }),
-            };
-            Self::send_json(&event);
+            return;
         }
+        self.session.state = SessionState::Halted;
+        let pc = self.session.backend.read_regs(None).ok().and_then(|regs| {
+            regs.get("pc")
+                .or_else(|| regs.get("PC"))
+                .copied()
+                .map(|v| v as u32)
+        });
+        let event = JsonEvent {
+            event: "halted".into(),
+            data: json!({
+                "pc": pc.unwrap_or(0),
+                "core": self.session.backend.active_core(),
+            }),
+        };
+        Self::send_json(&event);
     }
 
     // ── I/O 辅助方法 ──
 
     /// 向 stdout 写入一行 JSON
     fn send_json<T: Serialize>(msg: &T) {
-        if let Ok(json_str) = serde_json::to_string(msg) {
-            println!("{json_str}");
+        match serde_json::to_string(msg) {
+            Ok(json_str) => println!("{json_str}"),
+            Err(e) => eprintln!("[FATAL] JSON serialization failed: {e}"),
         }
     }
 
