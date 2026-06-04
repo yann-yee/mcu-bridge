@@ -66,7 +66,7 @@ impl Session {
     /// 安全断开探针连接。
     pub fn detach(&mut self) -> anyhow::Result<()> {
         info!("detaching session from {}", self.chip_name);
-        self.backend.lock().unwrap().detach()
+        self.backend.lock().expect("backend lock").detach()
     }
 
     /// 创建一个初始状态为 Halted 的会话（无后端连接）。

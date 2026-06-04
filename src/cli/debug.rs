@@ -305,6 +305,8 @@ impl DebugRepl {
                 None => continue,
             }
         }
+        // 确保采样线程在 quit 前停止
+        self.stop_sampler();
         self.session.detach()?;
         println!("[OK] debug session ended");
         Ok(())
@@ -362,7 +364,11 @@ impl DebugRepl {
     fn cmd_halt(&mut self) -> anyhow::Result<()> {
         // 先停止采样线程
         self.stop_sampler();
-        self.session.backend.lock().unwrap().halt(None)?;
+        self.session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .halt(None)?;
         self.session.state = SessionState::Halted;
         println!("[OK] target halted");
         Ok(())
@@ -370,7 +376,14 @@ impl DebugRepl {
 
     /// 全速运行 — 自动启动采样线程
     fn cmd_resume(&mut self) -> anyhow::Result<()> {
-        self.session.backend.lock().unwrap().resume(None)?;
+        if self.sampler_thread.is_some() {
+            anyhow::bail!("sampler thread already running, halt first");
+        }
+        self.session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .resume(None)?;
         self.session.state = SessionState::Running;
 
         // 如果有 watch target，启动采样线程
@@ -447,9 +460,19 @@ impl DebugRepl {
 
     /// 单步执行
     fn cmd_step(&mut self) -> anyhow::Result<()> {
-        self.session.backend.lock().unwrap().step(None)?;
+        self.session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .step(None)?;
         // 读取 PC 显示当前位置
-        if let Ok(regs) = self.session.backend.lock().unwrap().read_regs(None) {
+        if let Ok(regs) = self
+            .session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .read_regs(None)
+        {
             if let Some(pc_val) = regs.get("pc").or_else(|| regs.get("PC")) {
                 let pc = *pc_val as u32;
                 self.session.pc = Some(pc);
@@ -479,7 +502,12 @@ impl DebugRepl {
 
     /// 显示寄存器
     fn cmd_regs(&mut self) -> anyhow::Result<()> {
-        let regs = self.session.backend.lock().unwrap().read_regs(None)?;
+        let regs = self
+            .session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .read_regs(None)?;
         // 收集并排序 key
         let mut keys: Vec<&String> = regs.keys().collect();
         keys.sort();
@@ -673,13 +701,17 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     for addr_str in &args.break_at {
         let addr = parse_u32(addr_str)
             .map_err(|_| anyhow::anyhow!("invalid breakpoint address: '{addr_str}'"))?;
-        let id = session.backend.lock().unwrap().set_breakpoint(addr, None)?;
+        let id = session
+            .backend
+            .lock()
+            .expect("backend lock")
+            .set_breakpoint(addr, None)?;
         println!("[#{}] breakpoint at 0x{addr:08x}", id);
     }
 
     // halt-on-start 优先；仅当未指定 halt-on-start 且指定了 continue 时才 resume
     if !args.halt_on_start && args.continue_ {
-        session.backend.lock().unwrap().resume(None)?;
+        session.backend.lock().expect("backend lock").resume(None)?;
         session.state = SessionState::Running;
         println!("[OK] target running");
     }

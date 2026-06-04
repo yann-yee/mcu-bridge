@@ -407,6 +407,7 @@ impl JsonSession {
                 break;
             }
         }
+        self.stop_sampler();
         self.session.detach()?;
         Ok(())
     }
@@ -493,12 +494,25 @@ impl JsonSession {
         match cmd {
             Command::Halt => {
                 self.stop_sampler();
-                self.session.backend.lock().unwrap().halt(None)?;
+                self.session
+                    .backend
+                    .lock()
+                    .expect("backend lock")
+                    .halt(None)?;
                 self.session.state = SessionState::Halted;
                 Ok(Some(json!({"status": "halted"})))
             }
             Command::Resume => {
-                self.session.backend.lock().unwrap().resume(None)?;
+                if self.sampler_thread.is_some() {
+                    return Ok(Some(
+                        json!({"status": "error", "error": "sampler already running, halt first"}),
+                    ));
+                }
+                self.session
+                    .backend
+                    .lock()
+                    .expect("backend lock")
+                    .resume(None)?;
                 self.session.state = SessionState::Running;
                 // 如果有 watch target，启动采样线程
                 let watch_count = self.buffer.read().unwrap().targets.len();
@@ -517,7 +531,11 @@ impl JsonSession {
                 ))
             }
             Command::Step => {
-                self.session.backend.lock().unwrap().step(None)?;
+                self.session
+                    .backend
+                    .lock()
+                    .expect("backend lock")
+                    .step(None)?;
                 let pc = self
                     .session
                     .backend
@@ -550,7 +568,12 @@ impl JsonSession {
                 Ok(Some(json!({"bp_id": id, "addr": addr})))
             }
             Command::Regs => {
-                let regs = self.session.backend.lock().unwrap().read_regs(None)?;
+                let regs = self
+                    .session
+                    .backend
+                    .lock()
+                    .expect("backend lock")
+                    .read_regs(None)?;
                 let mut map = serde_json::Map::new();
                 for (k, v) in &regs {
                     map.insert(k.clone(), json!(v));
@@ -628,19 +651,17 @@ impl JsonSession {
         if self.session.state != SessionState::Running {
             return;
         }
-        // 先获取 core 号，再一次性锁定 backend 检测 halt 状态
-        let active_core = self.session.backend.lock().unwrap().active_core();
-        if !self
-            .session
-            .backend
-            .lock()
-            .unwrap()
-            .is_halted(Some(active_core))
-        {
+        // 一次性锁定 backend，连续完成所有检测操作
+        let mut guard = self.session.backend.lock().expect("backend lock poisoned");
+        let active_core = guard.active_core();
+        if !guard.is_halted(Some(active_core)) {
             return;
         }
+        // 目标已 halt
         self.session.state = SessionState::Halted;
+        drop(guard); // 释放锁，允许 stop_sampler 获取
         self.stop_sampler();
+        // 重新锁 backend 读取 PC
         let pc = self
             .session
             .backend
