@@ -283,7 +283,7 @@ impl Command {
                 Ok(Self::Serial { since, channel })
             }
             "info" => {
-                let subcmd = match parts.get(1).map(|s| *s) {
+                let subcmd = match parts.get(1).copied() {
                     Some("functions") | Some("funcs") => InfoSubcmd::Functions,
                     Some("variables") | Some("vars") => InfoSubcmd::Variables,
                     Some(name) => InfoSubcmd::Symbol(name.to_string()),

@@ -29,8 +29,6 @@ pub struct DwarfResolver {
     functions: Vec<FunctionInfo>,
     /// 名称 → 地址列表（一个名称可能对应多个同名函数）
     function_by_name: HashMap<String, Vec<u32>>,
-    /// 地址 → 名称
-    name_by_function_addr: HashMap<u32, String>,
     /// 所有全局变量
     variables: Vec<VariableInfo>,
     /// 名称 → 变量信息
@@ -50,14 +48,11 @@ impl DwarfResolver {
     /// 从已提取的索引数据构建解析器（主要用于测试）。
     fn build(functions: Vec<FunctionInfo>, variables: Vec<VariableInfo>) -> anyhow::Result<Self> {
         let mut function_by_name: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut name_by_function_addr: HashMap<u32, String> = HashMap::new();
-
         for func in &functions {
             function_by_name
                 .entry(func.name.clone())
                 .or_default()
                 .push(func.low_addr);
-            name_by_function_addr.insert(func.low_addr, func.name.clone());
         }
 
         let mut variable_by_name: HashMap<String, VariableInfo> = HashMap::new();
@@ -68,7 +63,7 @@ impl DwarfResolver {
         Ok(DwarfResolver {
             functions,
             function_by_name,
-            name_by_function_addr,
+
             variables,
             variable_by_name,
         })
@@ -86,11 +81,8 @@ impl DwarfResolver {
     }
 
     /// 根据地址查找函数名和偏移。
+    #[expect(dead_code)]
     pub fn addr_function(&self, addr: u32) -> Option<&str> {
-        // 精确匹配
-        if let Some(name) = self.name_by_function_addr.get(&addr) {
-            return Some(name.as_str());
-        }
         // 范围匹配：查找包含该地址的函数
         self.functions
             .iter()
@@ -125,7 +117,7 @@ impl DwarfResolver {
         self.variables.len()
     }
 
-    /// 是否有任何 DWARF 信息可用。
+    #[expect(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty() && self.variables.is_empty()
     }

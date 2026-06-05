@@ -127,6 +127,7 @@ fn resolve_size_from_type(
 }
 
 /// 在指定的 DebugInfoOffset 处解析 DIE 的 byte_size。
+#[expect(clippy::only_used_in_recursion)]
 fn resolve_entry_byte_size(
     dwarf: &gimli::Dwarf<Reader>,
     unit: &gimli::Unit<Reader>,
@@ -139,9 +140,8 @@ fn resolve_entry_byte_size(
 
     // 直接读取 byte_size
     if let Some(attr) = type_entry.attr(gimli::DW_AT_byte_size).ok()? {
-        match attr.value() {
-            gimli::AttributeValue::Udata(size) => return Some(size as u32),
-            _ => {}
+        if let gimli::AttributeValue::Udata(size) = attr.value() {
+            return Some(size as u32);
         }
     }
 
@@ -151,15 +151,11 @@ fn resolve_entry_byte_size(
     }
 
     // typedef — 跟随其 DW_AT_type
-    if type_entry.tag() == gimli::DW_TAG_typedef {
-        if let Some(attr) = type_entry.attr(gimli::DW_AT_type).ok()? {
-            match attr.value() {
-                gimli::AttributeValue::DebugInfoRef(next_offset) => {
-                    return resolve_entry_byte_size(dwarf, unit, &next_offset);
-                }
-                _ => {}
-            }
-        }
+    if type_entry.tag() == gimli::DW_TAG_typedef
+        && let Some(attr) = type_entry.attr(gimli::DW_AT_type).ok()?
+        && let gimli::AttributeValue::DebugInfoRef(next_offset) = attr.value()
+    {
+        return resolve_entry_byte_size(dwarf, unit, &next_offset);
     }
 
     None
