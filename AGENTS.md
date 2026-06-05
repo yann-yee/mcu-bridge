@@ -94,6 +94,10 @@
   - 启动时等待 TCL telnet 端口就绪（`localhost:6666`），超时则报错退出。
   - 单条 TCL 命令超时（默认 5s）视为 OpenOCD 进程状态异常 → 杀掉子进程 → 重启 → 重新 attach。
   - `mcu-bridge` 进程退出时（包括 panic），必须通过 `Drop` 或 `Drop` guard 确保 OpenOCD 子进程被 kill，不留僵尸进程。
+  - **TCL 响应解析模式** `[← archive/openocd-debug-backend 经验]`: OpenOCD TCL 接口的响应格式是不统一的，给解析带来两个特定暗礁：
+    1. `read_memory` 命令返回 Tcl list 格式 `{0x12345678 0x9abcdef0 ...}`（花括号包裹的空白分隔列表）。必须 `response.trim().trim_start_matches('{').trim_end_matches('}')` 去除花括号后再 `split_whitespace()` 逐 word 解析，而不是按行解析。每个 word 可能带 `0x` 或 `0X` 前缀。
+    2. `reg` 命令输出格式为 `(0) r0 (/32): 0x00000000`，可能附带 `(dirty)` 标记：`(0) r0 (/32): 0x00000000 (dirty)`。解析时需要：跳过不以 `(` 开头的行；提取 `:` 分隔符前后的 name/value 部分；`split_whitespace().next()` 取第一个 word 作为值以忽略 `(dirty)` 后缀；无法解析的行跳过而非 panic。
+    3. 通用原则：`wait_halt 1` 成功时返回空响应（仅 `> ` 提示符），不保含关键词，需检查 `!resp.contains("timeout")` 而非检查 error/failed。与之相反，`halt/step/resume/bp/rbp` 等命令在失败时返回含错误关键词的文本，需检查 `contains("error") || contains("failed")`。
 
 #### 3.2 并发与线程安全
 
