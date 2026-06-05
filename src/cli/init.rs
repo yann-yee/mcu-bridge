@@ -36,8 +36,16 @@ pub(crate) fn get_chip_template(name: &str) -> anyhow::Result<ChipConfig> {
             ram_base: 0x2000_0000,
             ram_size: 0x0002_0000, // 128KB
         }),
+        "STM32F103" | "STM32F103C8" | "STM32F103C8T6" => Ok(ChipConfig {
+            name: "STM32F103C8T6".into(),
+            architecture: "cortex-m3".into(),
+            flash_base: 0x0800_0000,
+            flash_size: 0x0001_0000, // 64KB
+            ram_base: 0x2000_0000,
+            ram_size: 0x0000_5000, // 20KB
+        }),
         unknown => anyhow::bail!(
-            "unknown chip '{}'. Available: STM32F407VG, STM32F411(RE/RET6)",
+            "unknown chip '{}'. Available: STM32F407VG, STM32F411(RE/RET6), STM32F103(C8T6)",
             unknown
         ),
     }
