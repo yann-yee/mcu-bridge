@@ -395,7 +395,7 @@ impl DebugProbe for OpenOcdBackend {
 
     fn read_mem(&mut self, addr: u32, len: u32, _core: Option<usize>) -> anyhow::Result<Vec<u8>> {
         // OpenOCD 以 word (32-bit) 为单位读内存
-        let count = (len + 3) / 4;
+        let count = len.div_ceil(4);
         let cmd = format!("read_memory 0x{addr:x} 32 {count}");
         let response = self.tcl_command(&cmd)?;
 

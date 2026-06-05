@@ -342,7 +342,7 @@ mod tests {
         monitor.stop().unwrap();
 
         let mut received = 0usize;
-        while let Ok(_) = rx.try_recv() {
+        while rx.try_recv().is_ok() {
             received += 1;
         }
         assert!(received > 0, "should have received some events");
