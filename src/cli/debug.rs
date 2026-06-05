@@ -23,6 +23,7 @@ use crate::buffer::{DebugBuffer, LogBuffer, Sampler};
 use crate::cli::init;
 use crate::cli::json_session::JsonSession;
 use crate::config::{ChipConfig, FlashOpts};
+use crate::dwarf::DwarfResolver;
 use crate::log::detect_log_backend;
 use crate::probe::DebugProbe;
 use crate::probe::openocd::OpenOcdBackend;
@@ -85,6 +86,28 @@ pub enum Command {
         since: Option<u64>,
         channel: Option<String>,
     },
+    /// 查询符号信息（DWARF）
+    Info {
+        subcmd: InfoSubcmd,
+    },
+}
+
+/// info 子命令
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfoSubcmd {
+    Functions,
+    Variables,
+    Symbol(String),
+}
+
+impl fmt::Display for InfoSubcmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Functions => write!(f, "functions"),
+            Self::Variables => write!(f, "variables"),
+            Self::Symbol(name) => write!(f, "symbol {name}"),
+        }
+    }
 }
 
 impl fmt::Display for Command {
@@ -126,6 +149,7 @@ impl fmt::Display for Command {
                 }
                 Ok(())
             }
+            Self::Info { subcmd } => write!(f, "info {subcmd}"),
         }
     }
 }
@@ -134,8 +158,9 @@ impl Command {
     /// 从用户输入的字符串解析命令。
     ///
     /// 支持 `0x` 前缀十六进制地址和纯十进制数。
+    /// 如果提供 `dwarf` 解析器，函数名/变量名可代替地址。
     /// 返回 `Err` 时包含人类可读的错误消息。
-    pub fn parse(input: &str) -> Result<Self, String> {
+    pub fn parse(input: &str, dwarf: Option<&DwarfResolver>) -> Result<Self, String> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err("empty input".into());
@@ -165,14 +190,23 @@ impl Command {
             }
             "break" | "b" => {
                 if parts.len() < 2 {
-                    return Err("usage: break <addr>".into());
+                    return Err("usage: break <addr|funcname>".into());
                 }
-                let addr = parse_u32(parts[1]).map_err(|_| {
-                    format!(
+                let addr = if let Ok(a) = parse_u32(parts[1]) {
+                    a
+                } else if let Some(resolver) = dwarf {
+                    resolver.function_addr(parts[1]).ok_or_else(|| {
+                        format!(
+                            "cannot resolve '{}' as hex address or function name",
+                            parts[1]
+                        )
+                    })?
+                } else {
+                    return Err(format!(
                         "invalid address: '{}'. Use hex (0x...) or decimal.",
                         parts[1]
-                    )
-                })?;
+                    ));
+                };
                 Ok(Self::Break { addr })
             }
             "regs" | "registers" => {
@@ -206,9 +240,9 @@ impl Command {
             "quit" | "exit" | "q" => Ok(Self::Quit),
             "watch" | "w" => {
                 if parts.len() < 2 {
-                    return Err("usage: watch <addr>:<size>[:<label>]".into());
+                    return Err("usage: watch <addr|varname>[:size[:label]]".into());
                 }
-                let (addr, size, label) = crate::buffer::DebugBuffer::parse_watch_spec(parts[1])?;
+                let (addr, size, label) = resolve_watch_spec(parts[1], dwarf)?;
                 Ok(Self::Watch { addr, size, label })
             }
             "buffer" | "buff" => {
@@ -250,6 +284,17 @@ impl Command {
                 };
                 Ok(Self::Serial { since, channel })
             }
+            "info" => {
+                let subcmd = match parts.get(1).map(|s| *s) {
+                    Some("functions") | Some("funcs") => InfoSubcmd::Functions,
+                    Some("variables") | Some("vars") => InfoSubcmd::Variables,
+                    Some(name) => InfoSubcmd::Symbol(name.to_string()),
+                    None => {
+                        return Err("usage: info <functions|variables|symbol <name>>".into());
+                    }
+                };
+                Ok(Self::Info { subcmd })
+            }
             _ => Err(format!(
                 "unknown command '{}'. Type 'help' for available commands.",
                 parts[0]
@@ -266,7 +311,8 @@ impl Command {
             Self::Resume | Self::Step | Self::Break { .. } | Self::Regs | Self::Mem { .. } => {
                 Some(&[SessionState::Halted])
             }
-            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } | Self::Serial { .. } => {
+            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } | Self::Serial { .. }
+            | Self::Info { .. } => {
                 None
             }
             Self::Watch { .. } => Some(&[SessionState::Halted]),
@@ -283,6 +329,62 @@ fn parse_u32(s: &str) -> Result<u32, std::num::ParseIntError> {
     }
 }
 
+/// 解析 watch 规格，支持地址格式和 DWARF 变量名格式。
+///
+/// 格式:
+/// - `0x20000000:4:label` — 地址:大小:标签
+/// - `adc_val` — 变量名（自动推导大小）
+/// - `adc_val:2` — 变量名:覆盖大小
+fn resolve_watch_spec(spec: &str, dwarf: Option<&DwarfResolver>) -> Result<(u32, u32, Option<String>), String> {
+    let colons: Vec<&str> = spec.split(':').collect();
+
+    // 尝试将第一段解析为十六进制地址
+    if let Ok(addr) = parse_u32(colons[0]) {
+        // 地址格式：addr:size[:label]
+        let size = if colons.len() > 1 {
+            colons[1]
+                .parse::<u32>()
+                .map_err(|_| format!("invalid size: '{}'. Use decimal.", colons[1]))?
+        } else {
+            return Err("watch spec requires size when using hex address, e.g. 0x20000000:4".into());
+        };
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return Err(format!("watch size must be 1, 2, 4, or 8, got {size}"));
+        }
+        let label = colons.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        return Ok((addr, size, label));
+    }
+
+    // 地址失败 → 尝试 DWARF 变量名
+    if let Some(resolver) = dwarf {
+        let var = resolver
+            .variable_info(colons[0])
+            .ok_or_else(|| format!("cannot resolve '{}' as address or variable name", colons[0]))?;
+        let size = if colons.len() > 1 {
+            let s = colons[1]
+                .parse::<u32>()
+                .map_err(|_| format!("invalid size: '{}'. Use decimal.", colons[1]))?;
+            if !matches!(s, 1 | 2 | 4 | 8) {
+                return Err(format!("watch size must be 1, 2, 4, or 8, got {s}"));
+            }
+            s
+        } else {
+            var.size
+        };
+        let label = colons
+            .get(2)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| Some(colons[0].to_string()));
+        return Ok((var.addr, size, label));
+    }
+
+    Err(format!(
+        "invalid address: '{}'. Use hex (0x...) or decimal.",
+        colons[0]
+    ))
+}
+
 /// 交互式调试 REPL
 pub struct DebugRepl {
     /// 调试会话
@@ -297,11 +399,18 @@ pub struct DebugRepl {
     sampler_stop: Option<Arc<AtomicBool>>,
     /// 采样间隔（ms）
     sampling_interval: u64,
+    /// DWARF 符号解析器
+    dwarf: Option<DwarfResolver>,
 }
 
 impl DebugRepl {
     /// 创建 REPL 实例。
-    pub fn new(session: Session, sampling_interval: u64, buffer_capacity: usize) -> Self {
+    pub fn new(
+        session: Session,
+        sampling_interval: u64,
+        buffer_capacity: usize,
+        dwarf: Option<DwarfResolver>,
+    ) -> Self {
         let rl = DefaultEditor::new().unwrap_or_else(|_| DefaultEditor::new().unwrap());
         Self {
             session,
@@ -310,6 +419,7 @@ impl DebugRepl {
             sampler_thread: None,
             sampler_stop: None,
             sampling_interval,
+            dwarf,
         }
     }
 
@@ -349,7 +459,7 @@ impl DebugRepl {
         match self.rl.readline("(mcu) > ") {
             Ok(line) => {
                 self.rl.add_history_entry(&line).ok();
-                match Command::parse(&line) {
+                match Command::parse(&line, self.dwarf.as_ref()) {
                     Ok(cmd) => Some(cmd),
                     Err(e) => {
                         if !line.trim().is_empty() {
@@ -388,6 +498,7 @@ impl DebugRepl {
             Command::Watch { addr, size, label } => self.cmd_watch(addr, size, label),
             Command::Buffer { since, watch_id } => self.cmd_buffer(since, watch_id),
             Command::Serial { since, channel } => self.cmd_serial(since, channel),
+            Command::Info { subcmd } => self.cmd_info(subcmd),
         }
     }
 
@@ -504,6 +615,58 @@ impl DebugRepl {
     /// 查询日志历史
     fn cmd_serial(&self, _since: Option<u64>, _channel: Option<String>) -> anyhow::Result<()> {
         println!("[NOTE] serial log viewing is only available in JSON-Lines mode");
+        Ok(())
+    }
+
+    /// 查询符号信息（DWARF）。
+    fn cmd_info(&self, subcmd: InfoSubcmd) -> anyhow::Result<()> {
+        let dwarf = match self.dwarf.as_ref() {
+            Some(d) => d,
+            None => {
+                println!("[ERROR] no DWARF info available (load an ELF with --elf)");
+                return Ok(());
+            }
+        };
+        match subcmd {
+            InfoSubcmd::Functions => {
+                let funcs = dwarf.list_functions();
+                if funcs.is_empty() {
+                    println!("[INFO] no functions found in DWARF");
+                    return Ok(());
+                }
+                println!("Functions ({}):", funcs.len());
+                for f in funcs {
+                    println!("  {:<30} 0x{:08x}..0x{:08x} ({} bytes)", f.name, f.low_addr, f.high_addr, f.high_addr - f.low_addr);
+                }
+            }
+            InfoSubcmd::Variables => {
+                let vars = dwarf.list_variables();
+                if vars.is_empty() {
+                    println!("[INFO] no global variables found in DWARF");
+                    return Ok(());
+                }
+                println!("Global variables ({}):", vars.len());
+                for v in vars {
+                    println!("  {:<30} 0x{:08x} size={}", v.name, v.addr, v.size);
+                }
+            }
+            InfoSubcmd::Symbol(name) => {
+                // 尝试作为函数查询
+                if let Some(addr) = dwarf.function_addr(&name) {
+                    println!("function '{}' @ 0x{:08x}", name, addr);
+                    return Ok(());
+                }
+                // 尝试作为变量查询
+                if let Some(var) = dwarf.variable_info(&name) {
+                    println!(
+                        "variable '{}' @ 0x{:08x} size={} type={:?}",
+                        name, var.addr, var.size, var.type_name
+                    );
+                    return Ok(());
+                }
+                println!("[ERROR] '{}' not found in DWARF symbols", name);
+            }
+        }
         Ok(())
     }
 
@@ -637,10 +800,15 @@ impl DebugRepl {
         println!("  halt              Pause target execution");
         println!("  resume, go        Resume target execution (starts sampler)");
         println!("  step, s           Single-step (halted)");
-        println!("  break <addr>, b   Set hardware breakpoint (halted)");
+        println!("  break <addr|funcname>, b  Set hardware breakpoint (halted)");
         println!("  regs, registers   Show core registers (halted)");
         println!("  mem <addr> <len>  Read memory (halted)");
-        println!("  watch <a>:<s>[:l] Add watch target, e.g. 0x20000000:4:counter (halted)");
+        println!("  watch <a|varname>[:<s>[:l]] Add watch target (halted)");
+        println!("  buffer [since] [watch_id] Show sampling history");
+        println!("  serial [since] [channel]  Show log history (JSON-Lines mode)");
+        println!("  info functions    List functions from DWARF");
+        println!("  info variables    List global variables from DWARF");
+        println!("  info symbol <n>   Look up a symbol in DWARF");
         println!("  buffer [since] [watch_id] Show sampling history");
         println!("  serial [since] [channel]  Show log history (JSON-Lines mode)");
         println!("  status, st        Show session status");
@@ -807,7 +975,23 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
             js.run()?;
         }
     } else {
-        let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity);
+        // 加载 DWARF 符号信息（如果 ELF 可用）
+        let dwarf = if args.elf.as_os_str().is_empty() {
+            None
+        } else {
+            match DwarfResolver::from_elf(&args.elf) {
+                Ok(d) => {
+                    log::info!("DWARF loaded: {} functions, {} variables", d.function_count(), d.variable_count());
+                    Some(d)
+                }
+                Err(e) => {
+                    log::warn!("failed to load DWARF from '{}': {e}", args.elf.display());
+                    None
+                }
+            }
+        };
+
+        let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity, dwarf);
 
         // 处理 --watch 参数（启动时添加观测目标）
         for watch_spec in &args.watch_targets {
@@ -829,29 +1013,34 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// 测试用 parse 包装，默认无 DWARF 解析器。
+    fn p(input: &str) -> Result<Command, String> {
+        Command::parse(input, None)
+    }
+
     // ── 命令解析测试 ──
 
     #[test]
     fn test_parse_halt() {
-        assert_eq!(Command::parse("halt").unwrap(), Command::Halt);
+        assert_eq!(p("halt").unwrap(), Command::Halt);
     }
 
     #[test]
     fn test_parse_resume() {
-        assert_eq!(Command::parse("resume").unwrap(), Command::Resume);
-        assert_eq!(Command::parse("go").unwrap(), Command::Resume);
+        assert_eq!(p("resume").unwrap(), Command::Resume);
+        assert_eq!(p("go").unwrap(), Command::Resume);
     }
 
     #[test]
     fn test_parse_step() {
-        assert_eq!(Command::parse("step").unwrap(), Command::Step);
-        assert_eq!(Command::parse("s").unwrap(), Command::Step);
+        assert_eq!(p("step").unwrap(), Command::Step);
+        assert_eq!(p("s").unwrap(), Command::Step);
     }
 
     #[test]
     fn test_parse_break() {
         assert_eq!(
-            Command::parse("break 0x08000100").unwrap(),
+            p("break 0x08000100").unwrap(),
             Command::Break { addr: 0x08000100 }
         );
     }
@@ -860,39 +1049,39 @@ mod tests {
     fn test_parse_break_decimal() {
         // 0x08000100 = 134217984
         assert_eq!(
-            Command::parse("break 134217984").unwrap(),
+            p("break 134217984").unwrap(),
             Command::Break { addr: 0x08000100 }
         );
     }
 
     #[test]
     fn test_parse_break_no_addr() {
-        assert!(Command::parse("break").is_err());
+        assert!(p("break").is_err());
     }
 
     #[test]
     fn test_parse_break_bad_addr() {
-        assert!(Command::parse("break abc").is_err());
+        assert!(p("break abc").is_err());
     }
 
     #[test]
     fn test_parse_break_short() {
         assert_eq!(
-            Command::parse("b 0x20000000").unwrap(),
+            p("b 0x20000000").unwrap(),
             Command::Break { addr: 0x20000000 }
         );
     }
 
     #[test]
     fn test_parse_regs() {
-        assert_eq!(Command::parse("regs").unwrap(), Command::Regs);
-        assert_eq!(Command::parse("registers").unwrap(), Command::Regs);
+        assert_eq!(p("regs").unwrap(), Command::Regs);
+        assert_eq!(p("registers").unwrap(), Command::Regs);
     }
 
     #[test]
     fn test_parse_mem() {
         assert_eq!(
-            Command::parse("mem 0x20000000 16").unwrap(),
+            p("mem 0x20000000 16").unwrap(),
             Command::Mem {
                 addr: 0x20000000,
                 len: 16
@@ -902,43 +1091,43 @@ mod tests {
 
     #[test]
     fn test_parse_mem_missing_len() {
-        assert!(Command::parse("mem 0x20000000").is_err());
+        assert!(p("mem 0x20000000").is_err());
     }
 
     #[test]
     fn test_parse_status() {
-        assert_eq!(Command::parse("status").unwrap(), Command::Status);
-        assert_eq!(Command::parse("st").unwrap(), Command::Status);
+        assert_eq!(p("status").unwrap(), Command::Status);
+        assert_eq!(p("st").unwrap(), Command::Status);
     }
 
     #[test]
     fn test_parse_help() {
-        assert_eq!(Command::parse("help").unwrap(), Command::Help);
-        assert_eq!(Command::parse("h").unwrap(), Command::Help);
-        assert_eq!(Command::parse("?").unwrap(), Command::Help);
+        assert_eq!(p("help").unwrap(), Command::Help);
+        assert_eq!(p("h").unwrap(), Command::Help);
+        assert_eq!(p("?").unwrap(), Command::Help);
     }
 
     #[test]
     fn test_parse_quit() {
-        assert_eq!(Command::parse("quit").unwrap(), Command::Quit);
-        assert_eq!(Command::parse("exit").unwrap(), Command::Quit);
-        assert_eq!(Command::parse("q").unwrap(), Command::Quit);
+        assert_eq!(p("quit").unwrap(), Command::Quit);
+        assert_eq!(p("exit").unwrap(), Command::Quit);
+        assert_eq!(p("q").unwrap(), Command::Quit);
     }
 
     #[test]
     fn test_parse_unknown() {
-        assert!(Command::parse("xyz").is_err());
+        assert!(p("xyz").is_err());
     }
 
     #[test]
     fn test_parse_whitespace() {
-        assert!(Command::parse("").is_err());
-        assert!(Command::parse("  ").is_err());
+        assert!(p("").is_err());
+        assert!(p("  ").is_err());
     }
 
     #[test]
     fn test_parse_trailing_whitespace() {
-        assert_eq!(Command::parse("halt  ").unwrap(), Command::Halt);
+        assert_eq!(p("halt  ").unwrap(), Command::Halt);
     }
 
     // ── 状态守卫测试 ──

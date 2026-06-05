@@ -691,6 +691,9 @@ impl JsonSession {
                     "count": filtered.len(),
                 })))
             }
+            Command::Info { .. } => {
+                Ok(Some(json!({"status": "error", "error": "info not available in JSON-Lines mode"})))
+            }
         }
     }
 
