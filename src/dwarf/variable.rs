@@ -139,10 +139,10 @@ fn resolve_entry_byte_size(
     let type_entry = entries.current()?;
 
     // 直接读取 byte_size
-    if let Some(attr) = type_entry.attr(gimli::DW_AT_byte_size).ok()? {
-        if let gimli::AttributeValue::Udata(size) = attr.value() {
-            return Some(size as u32);
-        }
+    if let Some(attr) = type_entry.attr(gimli::DW_AT_byte_size).ok()?
+        && let gimli::AttributeValue::Udata(size) = attr.value()
+    {
+        return Some(size as u32);
     }
 
     // 指针类型默认 4 字节

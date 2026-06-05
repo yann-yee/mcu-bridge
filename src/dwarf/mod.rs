@@ -81,7 +81,7 @@ impl DwarfResolver {
     }
 
     /// 根据地址查找函数名和偏移。
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn addr_function(&self, addr: u32) -> Option<&str> {
         // 范围匹配：查找包含该地址的函数
         self.functions
@@ -117,7 +117,7 @@ impl DwarfResolver {
         self.variables.len()
     }
 
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty() && self.variables.is_empty()
     }
