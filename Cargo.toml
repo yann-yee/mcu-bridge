@@ -30,6 +30,9 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# 串口通信（UART 通道）
+serialport = "4.7"
+
 # 配置与路径
 toml = "0.8"
 dirs = "6"

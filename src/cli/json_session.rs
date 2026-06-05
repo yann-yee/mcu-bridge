@@ -7,13 +7,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::buffer::{DebugBuffer, Sampler};
+use crate::buffer::serial::LogEvent;
+use crate::buffer::{DebugBuffer, LogBuffer, LogEntry, Sampler};
 use crate::cli::debug::Command;
 use crate::session::{Session, SessionState};
 
@@ -203,6 +204,23 @@ fn generate_schema() -> SchemaData {
             ]),
             valid_states: vec![],
         },
+        CommandMeta {
+            name: "serial".into(),
+            description: "Query serial log history (read from ring buffer)".into(),
+            args: Some(vec![
+                ArgMeta {
+                    name: "since".into(),
+                    arg_type: "u64".into(),
+                    required: false,
+                },
+                ArgMeta {
+                    name: "channel".into(),
+                    arg_type: "string".into(),
+                    required: false,
+                },
+            ]),
+            valid_states: vec![],
+        },
     ];
 
     let error_codes = HashMap::from([
@@ -341,6 +359,14 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
                 .map(|v| v as usize);
             Ok(Command::Buffer { since, watch_id })
         }
+        "serial" => {
+            let since = req.args.get("since").and_then(|v| v.as_u64());
+            let channel = req
+                .args
+                .get("channel")
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            Ok(Command::Serial { since, channel })
+        }
         unknown => Err(err_response(
             "E_PARAM",
             format!("unknown command '{}'", unknown),
@@ -356,6 +382,10 @@ pub struct JsonSession {
     session: Session,
     /// 共享调试缓冲区
     buffer: Arc<RwLock<DebugBuffer>>,
+    /// 共享日志缓冲区
+    log_buffer: Arc<RwLock<LogBuffer>>,
+    /// 日志事件接收端（从 SerialMonitor 线程接收）
+    log_event_rx: Option<mpsc::Receiver<LogEvent>>,
     /// 采样线程句柄
     sampler_thread: Option<std::thread::JoinHandle<()>>,
     /// 采样停止信号
@@ -366,10 +396,18 @@ pub struct JsonSession {
 
 impl JsonSession {
     /// 创建 JSON-Lines 会话
-    pub fn new(session: Session, sampling_interval: u64, buffer_capacity: usize) -> Self {
+    pub fn new(
+        session: Session,
+        sampling_interval: u64,
+        buffer_capacity: usize,
+        log_buffer: Arc<RwLock<LogBuffer>>,
+        log_event_rx: Option<mpsc::Receiver<LogEvent>>,
+    ) -> Self {
         Self {
             session,
             buffer: Arc::new(RwLock::new(DebugBuffer::new(buffer_capacity))),
+            log_buffer,
+            log_event_rx,
             sampler_thread: None,
             sampler_stop: None,
             sampling_interval,
@@ -391,6 +429,9 @@ impl JsonSession {
 
             // 事件检测（仅在 Running 态有意义）
             self.check_events();
+
+            // 日志事件推送（非阻塞检查 mpsc receiver）
+            self.push_log_events();
 
             // 解析请求
             let req: JsonRequest = match serde_json::from_str(&line) {
@@ -633,6 +674,23 @@ impl JsonSession {
                     json!({"samples": samples, "count": samples.iter().map(|v| v.len()).sum::<usize>()}),
                 ))
             }
+            Command::Serial { since, channel } => {
+                let log_buf = self.log_buffer.read().unwrap();
+                let entries: Vec<&LogEntry> = log_buf.get_since(since.unwrap_or(0));
+                let filtered: Vec<&LogEntry> = match &channel {
+                    Some(ch) => entries.into_iter().filter(|e| &e.channel == ch).collect(),
+                    None => entries,
+                };
+                Ok(Some(json!({
+                    "entries": filtered.iter().map(|e| json!({
+                        "sn": e.sn,
+                        "tick_us": e.tick_us,
+                        "channel": e.channel,
+                        "data": e.data,
+                    })).collect::<Vec<_>>(),
+                    "count": filtered.len(),
+                })))
+            }
         }
     }
 
@@ -691,6 +749,35 @@ impl JsonSession {
             }),
         };
         Self::send_json(&event);
+    }
+
+    /// 从 mpsc receiver 拉取日志事件并推送到 stdout（非阻塞）。
+    fn push_log_events(&mut self) {
+        let rx = match self.log_event_rx.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        // 尝试接收所有已到达的事件，但最多 10 条/轮以避免阻塞主循环
+        for _ in 0..10 {
+            match rx.try_recv() {
+                Ok(event) => {
+                    let json_event = JsonEvent {
+                        event: "log".into(),
+                        data: json!({
+                            "channel": event.channel,
+                            "data": event.data,
+                        }),
+                    };
+                    Self::send_json(&json_event);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // SerialMonitor 已停止，移除 receiver
+                    self.log_event_rx = None;
+                    break;
+                }
+            }
+        }
     }
 
     // ── I/O 辅助方法 ──
@@ -829,8 +916,8 @@ mod tests {
     #[test]
     fn test_schema_has_all_commands() {
         let schema = generate_schema();
-        // 12 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer
-        assert_eq!(schema.commands.len(), 12);
+        // 13 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer, serial
+        assert_eq!(schema.commands.len(), 13);
     }
 
     #[test]

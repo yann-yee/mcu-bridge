@@ -4,6 +4,7 @@
 /// 每个变体对应一个 `code()` 方法返回 `&'static str` 错误码。
 use thiserror::Error;
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum McuBridgeError {
     /// 命令在当前目标状态下不可用
@@ -57,6 +58,7 @@ pub enum McuBridgeError {
 
 impl McuBridgeError {
     /// 返回 JSON-Lines 协议中对应的错误码字符串。
+    #[allow(dead_code)]
     pub fn code(&self) -> &'static str {
         match self {
             Self::State => "E_STATE",

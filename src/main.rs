@@ -1,10 +1,6 @@
 //! mcu-bridge — 面向 AI Agent 的嵌入式调试中间件。
 //!
 //! 入口点：解析 CLI 子命令，分发到对应处理函数。
-//!
-//! ⚠ `dead_code` 是 P2 模块（openocd/rtt/uart/semihosting/buffer）临时抑制，P2 实现后移除。
-
-#![allow(dead_code)]
 
 mod buffer;
 mod cli;

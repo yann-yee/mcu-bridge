@@ -1,4 +1,4 @@
-//! flash 子命令 — 烧录 ELF 固件到目标芯片。
+//! flash 子命令 — 烧录 ELF 固件到目标芯片.
 //!
 //! 设计文档 §4.1：`mcu-bridge flash --elf target/firmware.elf [--verify] [--run]`
 //!
@@ -6,6 +6,8 @@
 //! 芯片配置来源（按优先级）：
 //!   1. `--chip` 命令行参数
 //!   2. `.debugger/chip.toml` 配置文件
+
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

@@ -34,6 +34,9 @@
 - **Watch Target**: 用户通过 `watch <variable> <size>` 命令设定的数据观测目标。支持 DWARF 变量名或裸地址。每个 target 独立 ring buffer。
 - **JSON-Lines**: Agent 模式的通信协议。stdin/stdout 每行一个完整 JSON 对象，无提示符。命令响应含 `status` 字段（`ok` / `halted` / `running` / `error`）。
 - **Schema 协议发现**: Agent 模式下的自描述机制。Agent 发送 `{"cmd":"schema"}` 获取完整命令规格（含参数类型、valid_states、响应格式、错误码表），不依赖外部文档即可完成协议适配。`mcu-bridge` 是协议的真实来源。
+- **SerialMonitor（日志接收线程）**: 日志通道接收监控器。独立线程循环调用 `LogChannel::read()` → 写入 `LogBuffer` + 通过 `mpsc` 发送 `LogEvent`。Human REPL 模式下无日志显示，JSON-Lines 模式下通过事件推送使 Agent 即时接收 MCU 日志。由 `Arc<Mutex<Box<dyn LogChannel>>>` 跨线程安全持有通道实例。
+- **LogBuffer**: 日志环形缓冲区（与 DebugBuffer 并列独立）。固定容量（默认 4096 条），每条 `LogEntry` 含 `sn/tick_us/channel/data`。Agent 通过 `{"cmd":"serial","subcmd":"read","since":N}` 拉取历史日志。
+- **LogEvent（即时推送）**: JSON-Lines 模式下的实时日志事件 `{"event":"log","channel":"rtt","data":"..."}`。由 SerialMonitor 线程通过 `mpsc::Sender` 推送到 json_session 的事件循环，每秒最多 100 条/通道。
 - **Flash 断点**: 突破硬件断点数量限制（4-6 个）的机制——用 BKPT 指令替换 Flash 中的指令。代价：设置/清除慢（几十~几百 ms）、消耗 Flash 擦写寿命、XIP 不可用。默认关闭，需 `--enable-flash-bp` 显式开启，每会话上限 100 次。
 - **芯片模板库**: 内置常用芯片（STM32/nRF/RP2040 等）的 Flash 地址/大小/RAM 地址等预设，以 TOML 文件维护。用户可通过 `mcu-bridge init --chip STM32F407VG` 自动填充。
 
@@ -51,9 +54,9 @@
 - **[P1] DebugBuffer + 定时采样 + ring buffer**: 独立线程，默认 10ms 周期通过 SWD 读取 watch target 值；断点触发时额外记录寄存器快照；连接恢复标记 gap。
 - **[P1] debug 子命令 + Human REPL + --json 模式 + schema 协议发现**: 双模式界面，Human REPL 有颜色和折叠，JSON-Lines 模式完整输出。schema 命令自描述协议。
 - **[P1] 探针连接自恢复**: `is_connected()` 检测 + `try_recover()` 重连（默认 3 次，间隔 500ms）+ 断点/watch 自动恢复。恢复失败时保留 buffer 数据优雅退出。
-- **[P1] LogChannel trait + RttChannel**: RTT Control Block 特征签名搜索 + probe-rs RTT 封装。Channel 0 为默认终端通道。
-- **[P1] UartChannel + serial read/write**: 物理串口支持，自动检测端口或用户指定。
-- **[P1] serial.backend = auto 三级 fallback**: RTT → UART → Semihosting 依次尝试，全部失败则报错退出。
+- **[P1] LogChannel trait + RttChannel**: RTT Control Block 特征签名搜索 + probe-rs RTT 封装。Channel 0 为默认终端通道。（⚠ P2 probe-rs 正式 semihosting API 前，SemihostingChannel::read 返回 Ok(0)）
+- **[P1] UartChannel + serial read/write**: 物理串口支持，自动检测端口或用户指定。（✅ 已完成）
+- **[P1] serial.backend = auto 三级 fallback**: RTT → UART → Semihosting 依次尝试，全部失败则返回 None（可选能力）。（✅ 已完成）
 - **[P2] SemihostingChannel**: BKPT 异常捕获实现。Semihosting 事件触发时暂停定时采样避免 SWD 总线竞争。
 - **[P2] 多核支持**: 单线程轮询所有核（SWD 总线物理串行化），DebugProbe trait 的 core 参数透传，各核独立管理断点/watch/buffer。
 - **[P2] OpenOCD backend**: TCL 关键词匹配 + 进程级重启（超时杀子进程→重启→重新 attach）+ Docker CI 固化 0.12 版本。
@@ -109,7 +112,11 @@
 
 - **诊断日志选型：`log` + `env_logger`（否定 tracing、否定 eprintln!）**: probe-rs 内部使用 `log` crate，同生态可直接通过 `RUST_LOG=probe_rs=debug` 看到探针库内部诊断。Human REPL 模式 stderr 彩色输出，JSON 模式 stdout 协议分离。否定了 tracing（async span 优势用不上）+ 手工 eprintln!（无级别过滤、无法切换输出目标）。
 
-- **Flash 烧录子命令策略：Standalone 即用即走模式**: `mcu-bridge flash` 使用独立临时 `ProbeRsBackend` 完成 attach → flash → detach，不与 `debug` 会话共享状态。芯片配置按 `--chip` 参数 > `.debugger/chip.toml` 优先级。烧录后默认 halt（等待用户/Agent 设断点），`--run` 参数使目标自动复位运行。校验默认开启（`--verify` true），可用 `--no-verify` 关闭。进度信息输出到 stderr。仅支持 probe-rs 后端（OpenOCD 待 P2）。否定了"依赖 debug session session 复用"（跨命令共享状态复杂）和"默认运行烧录后自动运行"（开发调试场景需要 halt 检查）。已对齐归档于 [user_plan/flash-probe-rs/flash-probe-rs.md](user_plan/flash-probe-rs/flash-probe-rs.md)。
+- **ProbeRsBackend 内部 RTT 字段，借用检查器模式**: RTT 的 `rtt_attach`/`rtt_read`/`rtt_write` 需同时访问 `self.session`（获取 Core）和 `self.rtt`（访问 UpChannel/DownChannel）。不能通过 `self.get_core()`（方法调用）获取 Core，因为这会整个借用 `self`。解决方案是直接通过字段路径访问 `self.session.as_mut().unwrap().core(idx)` 而非调用 `self.get_core()`——Rust 的字段级借用追踪允许同时可变借用 `self.session` 和 `self.rtt`（不同字段）。已在 `ProbeRsBackend::rtt_read/write` 中验证通过。否定了"将 RTT 放在外部由 RttChannel 管理"（来回传递 Session 所有权更复杂）。
+
+- **日志混合推送模式 Q2=C**: SerialMonitor 同时提供实时事件推送（`mpsc::Sender` → JSON-Lines `{"event":"log",...}`）和 ring buffer 历史存储（LogBuffer）。Agent 可在 `{"cmd":"serial","subcmd":"read","since":N}` 中查阅因思考错过的事件。频率限制 100 条/秒/通道防止高频日志打爆 Agent。否定了"纯实时推送"（Agent 思考时丢数据）和"纯轮询拉取"（无法即时响应日志中的关键事件）。
+
+- **LogChannel 通过 DebugProbe trait 扩展实现 RTT/Semihosting**: RTT 和 Semihosting 操作需要底层 `probe-rs::Core` 引用，不能通过高层的 `DebugProbe` 抽象方法（如 `read_mem`）间接实现。方案是在 `DebugProbe` trait 中新增 `rtt_attach/read/write/detach`、`enable_semihosting/read_semihosting` 方法（提供默认返回错误实现）。`ProbeRsBackend` 覆盖这些默认实现；`OpenOcdBackend` 使用默认错误实现（不支持 RTT/Semihosting）。`RttChannel`/`SemihostingChannel` 通过 `Arc<Mutex<Box<dyn DebugProbe>>>` 调用这些方法。否定了"在 LogChannel 中直接持有 probe-rs Session"（破坏 DebugProbe 抽象边界）和"让 RttChannel 通过 downcast 访问 ProbeRsBackend"（Rust 向下转型复杂且不安全）。
 
 ### 2. 核心功能流程定义
 
@@ -131,8 +138,9 @@
 - **日志通道 auto 检测流程**:
   1. 搜索 RAM 中 RTT Control Block 特征签名 `"SEGGER RTT"` → 找到 → RttChannel
   2. 未找到 → UART 自动检测端口 → 找到 → UartChannel
-  3. 未找到 → 启用 Semihosting → SemihostingChannel
-  4. 全部失败 → `{"status":"error","code":"E_SERIAL",...}` 退出
+  3. 未找到 → 启用 Semihosting → SemihostingChannel（P2 扩展 probe-rs 未直接暴露 API，当前 read 始终返回 0）
+  4. 全部失败 → `detect_log_backend()` 返回 `None`（日志通道为可选，不阻止会话继续）
+  5. 检测到的通道通过 `SerialMonitor` 线程双路投递：`LogBuffer`（历史拉取）+ `mpsc` 事件推送（JSON-Lines 模式）
 
 ### 3. 待确认 / 待测试事项 `[待确认/Draft]`
 
@@ -156,6 +164,8 @@
 - **[2026-06-03]**: 初始化本档案。从 `嵌入式调试软件.md` 设计文档中提炼项目一句话定位、核心受众、专有名词词汇表（mcu-bridge/DebugProbe/DebugBuffer/LogChannel/RTT/SWD/ring buffer/watch target/JSON-Lines/schema 协议发现/Flash 断点等 16 项）、P0-P3 实施路线里程碑、排除范围（不做 IDE 插件/GUI/GDB 协议/无线调试等 8 项）、架构决策与权衡理由（Rust 选型/probe-rs 优先/三级 fallback/单线程多核/关键词匹配/Flash 断点默认关闭等 8 项）、3 项待确认事项。(By Agent - Context-of-User)
 - **[2026-06-04]**: 伴随需求 [user_plan/flash-probe-rs/flash-probe-rs.md](user_plan/archive/flash-probe-rs/flash-probe-rs.md) 探底自检同步更新 Glossary 与 Non-Goals 属性。新增决策：Flash 烧录 Standalone 模式、芯片配置优先级规则、烧录后默认 halt/--run 运行、--verify 默认开启回读校验、进度 stderr 输出、仅 probe-rs 后端。已归档到 §四.1 架构决策。(By Agent - Understanding/Context-of-User)
 - **[2026-06-04]**: 验收并通过功能 [user_plan/archive/flash-probe-rs/](user_plan/archive/flash-probe-rs/)，实测 STM32F411RE 硬件烧录通过。提炼 2 条刺卡反哺 AGENTS.md：(1) probe-rs 芯片名精确性约束——模板 name 必须使用 probe-rs 识别的精确 target 名称，用户输入应透传；(2) 用户审批权原则——禁止擅自提交，所有 git push 前须获用户批准。AGENTS.md 已增补 §一.4 用户审批权原则 和 §二.2 probe-rs 芯片名精确性经验。目录已物理归档。(By Agent - Archive-and-Summary)
+- **[2026-06-06]**: 归档 LogChannel P1 需求。量子交叉审计共 95 项测试全绿通过 + spec.md 4 道红线全部守牢 + 修复 1 处空 channel 防护漏洞（`LogBuffer::push` 空 channel 回退 `"?"`）。提炼 1 条刺卡经验反哺 AGENTS.md：(1) Rust 字段级借用追踪模式——需要同时可变借用 `self` 两个不同字段时，绕过 `get_core()` 这类整体借用方法，通过直接字段路径访问 `self.session.as_mut().unwrap().core(idx)`，利用 Rust 字段级借用追踪实现多字段并发借用。目录已归档至 [user_plan/archive/log-channel-p1/](user_plan/archive/log-channel-p1/)。(By Agent - Archive-and-Summary)
+- **[2026-06-06]**: LogChannel P1 日志通道实现完成（自下而上构建）。新增 4 个 Glossary 术语（LogBuffer/SerialMonitor/LogEvent/SerialMonitor线程），新增 2 项架构决策（RTT via DebugProbe trait 扩展 + 日志混合推送模式 Q2=C），补全 P1 最后一环。需求归档于 [user_plan/log-channel-p1/log-channel-p1.md]。全量回归：cargo check 零 warning + cargo fmt 零差异 + 94/94 测试通过。(By Agent - Implementation)
 - **[2026-06-06]**: 验收并通过功能 [user_plan/archive/debug-buffer/](user_plan/archive/debug-buffer/)（评判本周期无痛点，宪法简炼合用不变）。(By Agent - Archive-and-Summary)
 - **[2026-06-06]**: 验收并通过功能 [user_plan/archive/debug-round2/](user_plan/archive/debug-round2/)（评判本周期无痛点，宪法简炼合用不变）。(By Agent - Archive-and-Summary)
 - **[2026-06-05]**: 开发并交付 OpenOCD 兜底烧录后端。通过 Understanding (Grill Me) 四轮决策对齐：后端选择 `[C]`（CLI>TOML>缺省 probe-rs）、配置文件 `[C]`（--openocd-cfg > TOML > .debugger/openocd.cfg 兜底）、烧录协议 `[A]`（program 一行命令）、进程生命周期 `[A]`（极简模式）。实现 `src/probe/openocd.rs` 的 `attach/flash/resume/detach/Drop` 五个方法，`src/cli/flash.rs` 的 `create_backend()` 工厂 + `handle()` 路由化。17/17 测试通过。新增决策：OpenOCD Standalone flash 极简生命周期。已物理归档至 [user_plan/archive/flash-openocd-backend/](user_plan/archive/flash-openocd-backend/)。(By Agent - Understanding + Archive-and-Summary)

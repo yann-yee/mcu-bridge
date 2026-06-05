@@ -5,19 +5,25 @@
 //!   Agent JSON-Lines — stdin→JSON，stdout→JSON，`--json` 模式
 //!
 //! 启动时先 `attach` 探针 → 进入 HALTED 态 → 等待用户/Agent 命令。
+//!
+//! ⚠ 部分 CLI 参数是 P2/P3 预留（config/verify/enable_flash_bp）。
+
+#![allow(dead_code)]
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::buffer::{DebugBuffer, Sampler};
+use crate::buffer::serial::SerialMonitor;
+use crate::buffer::{DebugBuffer, LogBuffer, Sampler};
 use crate::cli::init;
 use crate::cli::json_session::JsonSession;
 use crate::config::{ChipConfig, FlashOpts};
+use crate::log::detect_log_backend;
 use crate::probe::DebugProbe;
 use crate::probe::openocd::OpenOcdBackend;
 use crate::probe::probe_rs::ProbeRsBackend;
@@ -73,6 +79,11 @@ pub enum Command {
         since: Option<u64>,
         watch_id: Option<usize>,
     },
+    /// 查询日志历史（serial read）
+    Serial {
+        since: Option<u64>,
+        channel: Option<String>,
+    },
 }
 
 impl fmt::Display for Command {
@@ -101,6 +112,16 @@ impl fmt::Display for Command {
                 }
                 if let Some(w) = watch_id {
                     write!(f, " {w}")?;
+                }
+                Ok(())
+            }
+            Self::Serial { since, channel } => {
+                write!(f, "serial")?;
+                if let Some(s) = since {
+                    write!(f, " {s}")?;
+                }
+                if let Some(ch) = channel {
+                    write!(f, " {ch}")?;
                 }
                 Ok(())
             }
@@ -210,6 +231,24 @@ impl Command {
                     };
                 Ok(Self::Buffer { since, watch_id })
             }
+            "serial" => {
+                // serial [since] [channel]
+                let since = if parts.len() > 1 {
+                    Some(
+                        parts[1]
+                            .parse::<u64>()
+                            .map_err(|_| format!("invalid sn: '{}'. Use decimal.", parts[1]))?,
+                    )
+                } else {
+                    None
+                };
+                let channel = if parts.len() > 2 {
+                    Some(parts[2].to_string())
+                } else {
+                    None
+                };
+                Ok(Self::Serial { since, channel })
+            }
             _ => Err(format!(
                 "unknown command '{}'. Type 'help' for available commands.",
                 parts[0]
@@ -226,7 +265,9 @@ impl Command {
             Self::Resume | Self::Step | Self::Break { .. } | Self::Regs | Self::Mem { .. } => {
                 Some(&[SessionState::Halted])
             }
-            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } => None,
+            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } | Self::Serial { .. } => {
+                None
+            }
             Self::Watch { .. } => Some(&[SessionState::Halted]),
         }
     }
@@ -345,6 +386,7 @@ impl DebugRepl {
             Command::Quit => Ok(()), // handled by run()
             Command::Watch { addr, size, label } => self.cmd_watch(addr, size, label),
             Command::Buffer { since, watch_id } => self.cmd_buffer(since, watch_id),
+            Command::Serial { since, channel } => self.cmd_serial(since, channel),
         }
     }
 
@@ -455,6 +497,12 @@ impl DebugRepl {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// 查询日志历史
+    fn cmd_serial(&self, _since: Option<u64>, _channel: Option<String>) -> anyhow::Result<()> {
+        println!("[NOTE] serial log viewing is only available in JSON-Lines mode");
         Ok(())
     }
 
@@ -593,6 +641,7 @@ impl DebugRepl {
         println!("  mem <addr> <len>  Read memory (halted)");
         println!("  watch <a>:<s>[:l] Add watch target, e.g. 0x20000000:4:counter (halted)");
         println!("  buffer [since] [watch_id] Show sampling history");
+        println!("  serial [since] [channel]  Show log history (JSON-Lines mode)");
         println!("  status, st        Show session status");
         println!("  help, h, ?        Show this help");
         println!("  quit, exit, q     Exit debug session");
@@ -720,10 +769,34 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     let sampling_interval = args.sampling_interval.unwrap_or(10);
     let buffer_capacity = 128;
 
+    // 日志通道检测（可选 — 不阻止会话继续）
+    let log_buffer = Arc::new(RwLock::new(LogBuffer::new(4096)));
+    let (log_event_tx, log_event_rx) = mpsc::channel();
+
     // 路由到对应界面
     if args.json {
-        let mut js = JsonSession::new(session, sampling_interval, buffer_capacity);
-        js.run()?;
+        let shared_backend = session.shared_backend();
+        let mut js = JsonSession::new(
+            session,
+            sampling_interval,
+            buffer_capacity,
+            log_buffer.clone(),
+            Some(log_event_rx),
+        );
+
+        // JSON 模式：尝试检测日志后端并启动 SerialMonitor
+        if let Some(ch) = detect_log_backend(shared_backend, args.serial_port.clone(), 0) {
+            let mut monitor = SerialMonitor::new(ch, log_buffer, log_event_tx, 100);
+            monitor.start();
+            // SerialMonitor 线程在 JsonSession::run() 期间运行
+            // 当 JsonSession 退出时，monitor 会被 drop 自动停止
+            js.run()?;
+            // 确保 SerialMonitor 在会话结束前停止
+            let _ = monitor.stop();
+        } else {
+            log::info!("no log backend available, running without serial monitor");
+            js.run()?;
+        }
     } else {
         let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity);
 

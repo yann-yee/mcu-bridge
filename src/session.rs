@@ -16,7 +16,8 @@ pub enum SessionState {
     Halted,
     /// 目标全速运行中，定时采样线程活跃
     Running,
-    /// 探针断连，正在尝试自动恢复
+    /// 探针断连，正在尝试自动恢复（P1 预留）
+    #[allow(dead_code)]
     Recovering,
 }
 
@@ -74,6 +75,7 @@ impl Session {
     /// ⚠ 此方法仅用于无需真实探针连接的场景（如测试）。
     /// 常规使用请用 [`Session::attach`]。
     #[deprecated(since = "0.1.0", note = "use Session::attach() instead")]
+    #[allow(dead_code)]
     pub fn new(chip_name: String) -> Self {
         info!("session created for chip: {}", chip_name);
         Self {

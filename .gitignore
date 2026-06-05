@@ -20,3 +20,10 @@ Thumbs.db
 # IDE
 .vscode/settings.json
 .idea/
+
+vibecoding/
+user_plan/
+.mcp.json
+
+# MCP tool caches
+.codegraph/

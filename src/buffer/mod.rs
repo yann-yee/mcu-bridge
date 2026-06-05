@@ -1,7 +1,11 @@
-/// 调试缓冲层 — 核心差异化能力。
-///
-/// 设计文档 §3.2 定义了 ring buffer + 定时采样机制。
-/// Agent 不与实时 MCU 交互，与缓冲的历史数据交互。
+//! 调试缓冲层 — 核心差异化能力。
+//!
+//! 设计文档 §3.2 定义了 ring buffer + 定时采样机制。
+//! Agent 不与实时 MCU 交互，与缓冲的历史数据交互。
+//!
+//! ⚠ P2/P3 预留项标记了暂时未从调用链触达的公共 API 元素。
+
+#![allow(dead_code)]
 pub mod serial;
 
 use std::collections::HashMap;
@@ -38,6 +42,82 @@ pub struct Sample {
     pub old_val: Option<u64>,
     /// watchpoint 触发时的新值
     pub new_val: Option<u64>,
+}
+
+/// 日志条目 — 日志 ring buffer 中的一条数据。
+///
+/// SerialMonitor 线程写入，Agent/CLI 通过 serial 命令读取。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    /// 全局递增序列号
+    pub sn: u64,
+    /// μs 时间戳（主机侧）
+    pub tick_us: u64,
+    /// 来源通道: "rtt" | "uart" | "semihosting"
+    pub channel: String,
+    /// 日志文本
+    pub data: String,
+}
+
+/// 日志环形缓冲区。
+///
+/// 固定容量，写满后覆盖最旧记录。
+/// 与 DebugBuffer 的 ring buffer 语义一致。
+#[derive(Debug, Clone)]
+pub struct LogBuffer {
+    /// 环形缓冲
+    pub entries: Vec<LogEntry>,
+    /// 最大容量
+    pub capacity: usize,
+    /// 全局递增序列号
+    pub global_sn: u64,
+}
+
+impl LogBuffer {
+    /// 创建一个指定容量的日志缓冲区。
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+            global_sn: 0,
+        }
+    }
+
+    /// 追加一条日志条目（写满后覆盖最旧记录）。
+    /// 空 channel 名称会回退为 "?"。
+    pub fn push(&mut self, channel: &str, data: String) {
+        self.global_sn += 1;
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let channel_name = if channel.is_empty() { "?" } else { channel };
+        let entry = LogEntry {
+            sn: self.global_sn,
+            tick_us: now_us,
+            channel: channel_name.to_string(),
+            data,
+        };
+        if self.entries.len() >= self.capacity {
+            self.entries.remove(0);
+        }
+        self.entries.push(entry);
+    }
+
+    /// 查询 `sn >= since` 的日志条目。
+    pub fn get_since(&self, since: u64) -> Vec<&LogEntry> {
+        self.entries.iter().filter(|e| e.sn >= since).collect()
+    }
+
+    /// 返回当前条目数。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 缓冲区是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// 一个数据观测目标。
@@ -456,5 +536,66 @@ mod tests {
         let buf = DebugBuffer::new(128);
         let samples = buf.get_samples(None, None);
         assert!(samples.is_empty() || samples.iter().all(|v| v.is_empty()));
+    }
+
+    // ── LogBuffer 测试 ──
+
+    #[test]
+    fn test_log_buffer_push_and_len() {
+        let mut buf = LogBuffer::new(10);
+        assert!(buf.is_empty());
+        buf.push("rtt", "hello".into());
+        assert_eq!(buf.len(), 1);
+        buf.push("rtt", "world".into());
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn test_log_buffer_ring_overflow() {
+        let mut buf = LogBuffer::new(3);
+        for i in 0..5 {
+            buf.push("rtt", format!("msg {i}"));
+        }
+        // capacity 3, pushed 5 → keep last 3 (sn=3,4,5)
+        assert_eq!(buf.len(), 3);
+        let entries = buf.get_since(0);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sn, 3);
+        assert_eq!(entries[1].sn, 4);
+        assert_eq!(entries[2].sn, 5);
+    }
+
+    #[test]
+    fn test_log_buffer_get_since() {
+        let mut buf = LogBuffer::new(10);
+        for i in 0..5 {
+            buf.push("uart", format!("log {i}"));
+        }
+        let entries = buf.get_since(3);
+        assert_eq!(entries.len(), 3); // sn 3,4,5
+        assert_eq!(entries[0].sn, 3);
+        assert_eq!(entries[2].sn, 5);
+    }
+
+    #[test]
+    fn test_log_buffer_channel_name() {
+        let mut buf = LogBuffer::new(10);
+        buf.push("rtt", "a".into());
+        buf.push("uart", "b".into());
+        buf.push("semihosting", "c".into());
+        let entries = buf.get_since(1);
+        assert_eq!(entries[0].channel, "rtt");
+        assert_eq!(entries[1].channel, "uart");
+        assert_eq!(entries[2].channel, "semihosting");
+    }
+
+    #[test]
+    fn test_log_buffer_empty_channel_fallback() {
+        let mut buf = LogBuffer::new(10);
+        buf.push("", "data with empty channel".into());
+        let entries = buf.get_since(1);
+        assert_eq!(entries.len(), 1);
+        // 空 channel 应回退为 "?"
+        assert_eq!(entries[0].channel, "?");
     }
 }

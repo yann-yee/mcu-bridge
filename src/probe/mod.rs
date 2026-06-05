@@ -22,9 +22,11 @@ pub type WpId = usize;
 pub enum WatchKind {
     /// 仅读触发
     Read,
-    /// 仅写触发
+    /// 仅写触发（P2 预留）
+    #[allow(dead_code)]
     Write,
-    /// 读写均触发（默认）
+    /// 读写均触发（默认，P2 预留）
+    #[allow(dead_code)]
     ReadWrite,
 }
 
@@ -32,6 +34,9 @@ pub enum WatchKind {
 ///
 /// 所有方法均可失败返回 `anyhow::Error`。
 /// `core` 参数默认为 `None`（活跃核），显式传 `Some(n)` 指定目标核。
+///
+/// ⚠ 部分方法是 P2/P3 预留，当前未从 trait 调用路径触发 dead_code 警告。
+#[allow(dead_code)]
 pub trait DebugProbe: Send {
     // ── 会话生命周期 ──
 
@@ -104,6 +109,53 @@ pub trait DebugProbe: Send {
 
     /// 指定核是否处于 halted 状态
     fn is_halted(&mut self, core: Option<usize>) -> bool;
+
+    // ── RTT (Real-Time Transfer) ──
+
+    /// 搜索并附着 RTT Control Block。
+    ///
+    /// 成功后可通过 `rtt_read` / `rtt_write` 与 MCU 交换数据。
+    /// 默认返回错误（不支持 RTT 的后端）。
+    fn rtt_attach(&mut self, _core_idx: usize) -> anyhow::Result<()> {
+        anyhow::bail!("RTT not supported by this backend")
+    }
+
+    /// RTT 是否已附着。
+    fn rtt_is_attached(&self) -> bool {
+        false
+    }
+
+    /// 从指定 RTT up channel 读取数据。
+    fn rtt_read(&mut self, _channel: usize, _buf: &mut [u8]) -> anyhow::Result<usize> {
+        anyhow::bail!("RTT not supported by this backend")
+    }
+
+    /// 向指定 RTT down channel 写入数据。
+    fn rtt_write(&mut self, _channel: usize, _data: &[u8]) -> anyhow::Result<usize> {
+        anyhow::bail!("RTT not supported by this backend")
+    }
+
+    /// 断开 RTT 连接。
+    fn rtt_detach(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // ── Semihosting ──
+
+    /// 启用 ARM Semihosting 支持。
+    fn enable_semihosting(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("Semihosting not supported by this backend")
+    }
+
+    /// 读取 Semihosting 输出数据。
+    fn read_semihosting(&mut self, _buf: &mut [u8]) -> anyhow::Result<usize> {
+        anyhow::bail!("Semihosting not supported by this backend")
+    }
+
+    /// Semihosting 是否已启用。
+    fn is_semihosting_enabled(&self) -> bool {
+        false
+    }
 
     /// 轮询目标是否已 halt（更新内部缓存状态）。
     ///

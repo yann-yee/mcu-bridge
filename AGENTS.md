@@ -73,6 +73,8 @@
 
 - **Rust 借用检查器与 set_breakpoint 模式** `[← archive/p0-probe-cli 经验]`: 当 `DebugProbe` 方法需要同时操作内部状态（如 `bp_map`）和借出 `Core` 时，必须遵循「先修改 self、再借出子对象」的顺序。`get_core()` 返回拥有型 `Core` 后，编译器禁止再访问 `self.next_bp_id`。**标准模式**：先分配 ID/修改计数器/插入 map → 再调用 `self.get_core()` 获取 core → 操作硬件 → 失败时回滚前面已修改的 self 状态。不允许「先借 core、后改 self」的写法。
 
+- **Rust 字段级借用追踪模式** `[← archive/log-channel-p1 经验]`: 当需要同时可变借用 `self` 的两个不同字段（如 `self.rtt` 和 `self.session`）时，**不能**通过 `self.get_core()`（一个整体借用 `self` 的方法）获取 Core 引用。解决方案是绕过辅助方法，直接通过字段路径访问：`self.session.as_mut().unwrap().core(idx)`。Rust 编译器能理解 `self.session` 和 `self.rtt` 是同一个 struct 的不同字段，允许同时对其进行可变借用（即 Rust 的字段级借用追踪 / field-level borrow tracking）。已在 `ProbeRsBackend::rtt_read/write` 中验证通过。如果 `get_core()` 改为接收 `session: &mut Session` 参数而非 `&mut self` 方法，也能解决问题，但会破坏 API 封装一致性。
+
 - **probe-rs 芯片名精确性** `[← archive/flash-probe-rs 经验]`: probe-rs 的 `Session::auto_attach()` 要求芯片名称与其内部 target 数据库完全一致——`"STM32F411RE"` 可识别但 `"STM32F411"` 会报 `"Unable to load specification for chip"`。芯片模板的 `name` 字段必须使用 probe-rs 能识别的精确 target 名称。当用户通过 `--chip` 传入名称时，应透传原始输入值给 probe-rs，模板仅用于校验芯片存在性和提供架构参数（Flash/RAM 地址）。
 
 - **Cargo.lock 提交规范** `[← archive/ci-cd 经验]`: 二进制项目（`[[bin]]`）的 `Cargo.lock` **必须提交到版本控制**。CI 中 `Swatinem/rust-cache` 的缓存 key 基于 `Cargo.lock` hash——如果 lock 文件未提交，CI 每次运行 `cargo generate-lockfile` 都可能产生不同的 hash 导致缓存永不命中。任何删除 `.gitignore` 中的 `Cargo.lock` 过滤或 `.gitignore` 中遗漏 `Cargo.lock` 的情况，必须在首次 CI 配置时一并修复。

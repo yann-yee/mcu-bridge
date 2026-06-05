@@ -25,10 +25,17 @@ pub struct ProbeRsBackend {
     next_bp_id: BpId,
     /// 断点地址 → ID 映射（用于 clear_breakpoint 反查）
     bp_map: HashMap<u64, BpId>,
-    /// watchpoint ID 计数器
+    /// watchpoint ID 计数器（P2 预留）
+    #[allow(dead_code)]
     next_wp_id: WpId,
     /// 目标是否处于 halted 状态（由 halt/resume/wait_for_core_halted 同步更新）
     target_halted: bool,
+    /// RTT 接口（附着后持有）
+    rtt: Option<probe_rs::rtt::Rtt>,
+    /// RTT 附着的核编号
+    rtt_core_idx: usize,
+    /// Semihosting 是否已启用
+    semihosting_enabled: bool,
 }
 
 impl ProbeRsBackend {
@@ -42,6 +49,9 @@ impl ProbeRsBackend {
             bp_map: HashMap::new(),
             next_wp_id: 0,
             target_halted: false,
+            rtt: None,
+            rtt_core_idx: 0,
+            semihosting_enabled: false,
         }
     }
 
@@ -82,6 +92,8 @@ impl DebugProbe for ProbeRsBackend {
         self.session = None;
         self.bp_map.clear();
         self.num_cores = 0;
+        self.rtt = None;
+        self.semihosting_enabled = false;
         Ok(())
     }
 
@@ -261,6 +273,91 @@ impl DebugProbe for ProbeRsBackend {
             return true;
         }
         false
+    }
+
+    // ── RTT 实现 ──
+
+    fn rtt_attach(&mut self, core_idx: usize) -> anyhow::Result<()> {
+        // Core 必须在 self.rtt 赋值前释放
+        let rtt = {
+            let mut core = self.get_core(Some(core_idx))?;
+            probe_rs::rtt::Rtt::attach(&mut core)
+                .map_err(|e| anyhow::anyhow!("RTT attach failed: {e}"))?
+        };
+        self.rtt = Some(rtt);
+        self.rtt_core_idx = core_idx;
+        Ok(())
+    }
+
+    fn rtt_is_attached(&self) -> bool {
+        self.rtt.is_some()
+    }
+
+    fn rtt_read(&mut self, channel: usize, buf: &mut [u8]) -> anyhow::Result<usize> {
+        let rtt = self
+            .rtt
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("RTT not attached"))?;
+        let s = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("not attached"))?;
+        let mut core = s
+            .core(self.rtt_core_idx)
+            .map_err(|e| anyhow::anyhow!("get core failed: {e}"))?;
+        let ch = rtt
+            .up_channel(channel)
+            .ok_or_else(|| anyhow::anyhow!("RTT up channel {channel} not found"))?;
+        ch.read(&mut core, buf)
+            .map_err(|e| anyhow::anyhow!("RTT read failed: {e}"))
+    }
+
+    fn rtt_write(&mut self, channel: usize, data: &[u8]) -> anyhow::Result<usize> {
+        let rtt = self
+            .rtt
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("RTT not attached"))?;
+        let s = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("not attached"))?;
+        let mut core = s
+            .core(self.rtt_core_idx)
+            .map_err(|e| anyhow::anyhow!("get core failed: {e}"))?;
+        let ch = rtt
+            .down_channel(channel)
+            .ok_or_else(|| anyhow::anyhow!("RTT down channel {channel} not found"))?;
+        ch.write(&mut core, data)
+            .map_err(|e| anyhow::anyhow!("RTT write failed: {e}"))
+    }
+
+    fn rtt_detach(&mut self) -> anyhow::Result<()> {
+        self.rtt = None;
+        Ok(())
+    }
+
+    // ── Semihosting 实现 ──
+
+    fn enable_semihosting(&mut self) -> anyhow::Result<()> {
+        if self.session.is_none() {
+            anyhow::bail!("not attached");
+        }
+        self.semihosting_enabled = true;
+        Ok(())
+    }
+
+    fn is_semihosting_enabled(&self) -> bool {
+        self.semihosting_enabled
+    }
+
+    fn read_semihosting(&mut self, _buf: &mut [u8]) -> anyhow::Result<usize> {
+        if !self.semihosting_enabled {
+            anyhow::bail!("semihosting not enabled");
+        }
+        // probe-rs 0.31 不暴露直接的 semihosting 读 API。
+        // 由底层驱动在 halt 时自动捕获，此方法作为扩展点保留。
+        // TODO(P2): 当 probe-rs 提供正式 semihosting API 后升级实现。
+        Ok(0)
     }
 }
 
