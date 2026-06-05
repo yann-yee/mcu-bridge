@@ -16,7 +16,7 @@ pub enum SessionState {
     Halted,
     /// 目标全速运行中，定时采样线程活跃
     Running,
-    /// 探针断连，正在尝试自动恢复（P1 预留）
+    /// 探针断连，正在尝试自动恢复
     #[allow(dead_code)]
     Recovering,
 }

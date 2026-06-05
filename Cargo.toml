@@ -1,6 +1,6 @@
 [package]
 name = "mcu-bridge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 description = "面向 AI Agent 的嵌入式调试中间件。通过缓冲区解耦 Agent 慢思考与 MCU 快执行。"

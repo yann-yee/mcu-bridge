@@ -881,11 +881,18 @@ impl JsonSession {
                     .copied()
                     .map(|v| v as u32)
             });
+        // 通过 DWARF 查询 PC 对应的函数名
+        let function_name = pc.and_then(|pc_val| {
+            self.dwarf
+                .as_ref()
+                .and_then(|d| d.addr_function(pc_val).map(|s| s.to_string()))
+        });
         let event = JsonEvent {
             event: "halted".into(),
             data: json!({
                 "pc": pc.unwrap_or(0),
                 "core": active_core,
+                "function": function_name,
             }),
         };
         Self::send_json(&event);

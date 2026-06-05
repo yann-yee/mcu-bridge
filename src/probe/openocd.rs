@@ -20,6 +20,7 @@ use std::time::Duration;
 use crate::config::{ChipConfig, FlashOpts};
 use crate::probe::{BpId, WpId};
 use crate::probe::{DebugProbe, WatchKind};
+use log::info;
 
 /// OpenOCD 后端实现
 pub struct OpenOcdBackend {
@@ -41,6 +42,8 @@ pub struct OpenOcdBackend {
     /// watchpoint 地址 → ID 映射（P2 预留）
     #[allow(dead_code)]
     wp_map: HashMap<u64, WpId>,
+    /// 探针是否在线（由 is_connected/try_recover 维护）
+    connected: bool,
 }
 
 impl OpenOcdBackend {
@@ -58,6 +61,7 @@ impl OpenOcdBackend {
             bp_map: HashMap::new(),
             next_wp_id: 0,
             wp_map: HashMap::new(),
+            connected: false,
         }
     }
 
@@ -175,6 +179,7 @@ impl OpenOcdBackend {
         self.wp_map.clear();
         self.next_bp_id = 0;
         self.next_wp_id = 0;
+        self.connected = false;
     }
 }
 
@@ -209,6 +214,7 @@ impl DebugProbe for OpenOcdBackend {
         // 等待 TCP 端口就绪
         let stream = self.wait_for_telnet()?;
         self.telnet = Some(stream);
+        self.connected = true;
 
         Ok(())
     }
@@ -219,11 +225,56 @@ impl DebugProbe for OpenOcdBackend {
     }
 
     fn is_connected(&self) -> bool {
-        self.telnet.is_some()
+        self.connected
     }
 
     fn try_recover(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD recovery not yet implemented")
+        // 保存断点映射以便后续恢复
+        let saved_bps: Vec<u64> = self.bp_map.keys().copied().collect();
+        let saved_cfg = self.cfg_path.clone();
+
+        // 清理旧进程
+        self.cleanup_process();
+
+        // 重新解析配置文件
+        let resolved_cfg = match &saved_cfg {
+            Some(path) => path.clone(),
+            None => ".debugger/openocd.cfg".to_string(),
+        };
+        if !Path::new(&resolved_cfg).exists() {
+            anyhow::bail!("OpenOCD recovery failed: cfg file not found: {resolved_cfg}");
+        }
+
+        // 重新启动 OpenOCD 子进程
+        info!("try_recover: restarting OpenOCD with {resolved_cfg}");
+        self.spawn_openocd(&resolved_cfg)?;
+
+        // 等待 TCP 端口就绪
+        let stream = self.wait_for_telnet()?;
+        self.telnet = Some(stream);
+        self.connected = true;
+
+        // 先 halt 目标
+        if self.tcl_command("halt").is_ok() {
+            self.target_halted = true;
+        }
+
+        // 恢复断点
+        let mut restored = 0usize;
+        for addr in &saved_bps {
+            let addr_u32 = *addr as u32;
+            if let Err(e) = self.set_breakpoint(addr_u32, None) {
+                log::warn!("try_recover: failed to restore breakpoint at 0x{addr:08x}: {e}");
+            } else {
+                restored += 1;
+            }
+        }
+        info!(
+            "try_recover: re-attached, restored {}/{} breakpoints",
+            restored,
+            saved_bps.len()
+        );
+        Ok(())
     }
 
     fn flash(&mut self, elf: &Path, opts: &FlashOpts) -> anyhow::Result<()> {

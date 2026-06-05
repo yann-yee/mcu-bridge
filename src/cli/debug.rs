@@ -434,6 +434,9 @@ impl DebugRepl {
     /// 进入主交互循环，直至用户 quit 或出现致命错误。
     pub fn run(&mut self) -> anyhow::Result<()> {
         loop {
+            // 检测断点命中（Running → Halted 状态切换时输出）
+            self.check_halted();
+
             match self.read_command() {
                 Some(Command::Quit) => break,
                 Some(cmd) => {
@@ -576,6 +579,64 @@ impl DebugRepl {
             }
             // 超时：分离线程（采样卡在 read_mem 硬件超时中），不阻塞主线程
             // JoinHandle drop → 线程被分离，它会在 http 下回归
+        }
+    }
+
+    /// 检测断点命中（Running → Halted）。
+    /// 仅在 Running 状态下轮询 backend，如果检测到 halt 则输出 halt 信息含函数名。
+    fn check_halted(&mut self) {
+        if self.session.state != SessionState::Running {
+            return;
+        }
+        let mut guard = match self.session.backend.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let active_core = guard.active_core();
+        if !guard.is_halted(Some(active_core)) {
+            return;
+        }
+        self.session.state = SessionState::Halted;
+        drop(guard);
+        self.stop_sampler();
+
+        // 读取 PC
+        let pc = self
+            .session
+            .backend
+            .lock()
+            .unwrap()
+            .read_regs(None)
+            .ok()
+            .and_then(|regs| {
+                regs.get("pc")
+                    .or_else(|| regs.get("PC"))
+                    .copied()
+                    .map(|v| v as u32)
+            });
+        // 查询函数名
+        let func_info: Option<String> = pc.and_then(|pc_val| {
+            self.dwarf.as_ref().and_then(|d| {
+                d.addr_function(pc_val).map(|s| {
+                    let offset = pc_val.wrapping_sub(d.function_addr(s).unwrap_or(pc_val));
+                    if offset > 0 {
+                        format!("{s}+0x{offset:x}")
+                    } else {
+                        s.to_string()
+                    }
+                })
+            })
+        });
+        match (pc, func_info) {
+            (Some(pc_val), Some(fname)) => {
+                println!("[HALTED] {fname} (0x{pc_val:08x})");
+            }
+            (Some(pc_val), None) => {
+                println!("[HALTED] at 0x{pc_val:08x}");
+            }
+            (None, _) => {
+                println!("[HALTED]");
+            }
         }
     }
 

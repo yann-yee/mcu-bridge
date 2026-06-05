@@ -12,6 +12,7 @@ use probe_rs::MemoryInterface;
 use crate::config::{ChipConfig, FlashOpts};
 use crate::probe::{BpId, WpId};
 use crate::probe::{DebugProbe, WatchKind};
+use log::info;
 
 /// probe-rs 后端实现
 pub struct ProbeRsBackend {
@@ -36,6 +37,10 @@ pub struct ProbeRsBackend {
     rtt_core_idx: usize,
     /// Semihosting 是否已启用
     semihosting_enabled: bool,
+    /// 探针是否在线（由 is_connected/try_recover 维护）
+    connected: bool,
+    /// attach 时保存的芯片配置（供 try_recover 重连使用）
+    chip_config: Option<ChipConfig>,
 }
 
 impl ProbeRsBackend {
@@ -52,6 +57,8 @@ impl ProbeRsBackend {
             rtt: None,
             rtt_core_idx: 0,
             semihosting_enabled: false,
+            connected: false,
+            chip_config: None,
         }
     }
 
@@ -85,6 +92,8 @@ impl DebugProbe for ProbeRsBackend {
         self.num_cores = session.list_cores().len();
         self.session = Some(session);
         self.active_core = 0;
+        self.connected = true;
+        self.chip_config = Some(chip.clone());
         Ok(())
     }
 
@@ -94,17 +103,61 @@ impl DebugProbe for ProbeRsBackend {
         self.num_cores = 0;
         self.rtt = None;
         self.semihosting_enabled = false;
+        self.connected = false;
+        self.chip_config = None;
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        // P1 实现 — probe-rs Session 不提供在线检测 API，
-        // 需尝试一次轻量操作判断。P0 暂返回 session 是否存在。
-        self.session.is_some()
+        self.connected
     }
 
     fn try_recover(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("P1: probe recovery not yet implemented")
+        let chip = self
+            .chip_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no chip config saved for recovery"))?
+            .clone();
+
+        // 保存断点映射以便后续恢复
+        let saved_bps: Vec<u64> = self.bp_map.keys().copied().collect();
+
+        // 释放旧 session
+        self.session = None;
+        self.connected = false;
+
+        // 重新 attach
+        info!("try_recover: re-attaching to {}", chip.name);
+        let target = probe_rs::config::TargetSelector::Unspecified(chip.name.clone());
+        let config = probe_rs::SessionConfig {
+            permissions: probe_rs::Permissions::new(),
+            speed: None,
+            protocol: None,
+        };
+        let session = probe_rs::Session::auto_attach(target, config)
+            .map_err(|e| anyhow::anyhow!("recovery attach failed: {e}"))?;
+        self.num_cores = session.list_cores().len();
+        self.session = Some(session);
+        self.active_core = 0;
+        self.connected = true;
+        self.target_halted = false;
+
+        // 恢复断点
+        let mut restored = 0usize;
+        for addr in &saved_bps {
+            let addr_u32 = *addr as u32;
+            if let Err(e) = self.set_breakpoint(addr_u32, None) {
+                log::warn!("try_recover: failed to restore breakpoint at 0x{addr:08x}: {e}");
+            } else {
+                restored += 1;
+            }
+        }
+        info!(
+            "try_recover: re-attached, restored {}/{} breakpoints",
+            restored,
+            saved_bps.len()
+        );
+        Ok(())
     }
 
     fn flash(&mut self, elf: &Path, _opts: &FlashOpts) -> anyhow::Result<()> {

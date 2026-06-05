@@ -9,7 +9,7 @@
 pub mod serial;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -296,6 +296,8 @@ pub struct Sampler {
     stop_flag: Arc<AtomicBool>,
     /// 活跃核编号
     active_core: usize,
+    /// 剩余重试次数 (max 3)
+    retries_left: AtomicU32,
 }
 
 impl Sampler {
@@ -312,6 +314,7 @@ impl Sampler {
             interval: Duration::from_millis(interval_ms),
             stop_flag: Arc::new(AtomicBool::new(false)),
             active_core,
+            retries_left: AtomicU32::new(3),
         }
     }
 
@@ -329,8 +332,9 @@ impl Sampler {
     /// 4. 遍历所有 watch target 读取内存
     /// 5. 写入 ring buffer
     /// 6. `poll_halted()` 检测断点
+    /// 7. read_mem 失败时自动触发探针自恢复
     pub fn run(&mut self) {
-        loop {
+        'outer: loop {
             if self.stop_flag.load(Ordering::Relaxed) {
                 break;
             }
@@ -372,21 +376,85 @@ impl Sampler {
                         if let Ok(mut buf) = self.buffer.write() {
                             buf.push_sample(*id, sample);
                         }
+                        // read_mem 成功 → 重置重试计数
+                        self.retries_left.store(3, Ordering::Relaxed);
                     }
                     Err(e) => {
                         log::warn!("sampler: read_mem at 0x{addr:08x} failed: {e}");
+                        // 释放 backend 锁，尝试 recovery
+                        drop(guard);
+                        let recovered = self.attempt_recovery();
+                        if recovered {
+                            // 重新锁 backend 继续
+                            guard = match self.backend.lock() {
+                                Ok(g) => g,
+                                Err(_) => {
+                                    self.stop_flag.store(true, Ordering::Relaxed);
+                                    break 'outer;
+                                }
+                            };
+                            // 记录 gap=true 采样
+                            let gap_sample = Sample {
+                                sn: 0,
+                                tick_us: now_us,
+                                val: 0,
+                                core: self.active_core,
+                                bp_flag: false,
+                                gap: true,
+                                regs: None,
+                                old_val: None,
+                                new_val: None,
+                            };
+                            if let Ok(mut buf) = self.buffer.write() {
+                                buf.push_sample(*id, gap_sample);
+                            }
+                            self.retries_left.store(3, Ordering::Relaxed);
+                        } else {
+                            log::error!("sampler: recovery failed after 3 attempts, stopping");
+                            self.stop_flag.store(true, Ordering::Relaxed);
+                            break 'outer;
+                        }
                     }
                 }
             }
 
-            // 断点检测
-            if guard.poll_halted(Some(self.active_core)) {
-                self.stop_flag.store(true, Ordering::Relaxed);
-                // guard dropped here → unlock
+            // 断点检测（检查 stop_flag 防止已标记退出后仍操作 guard）
+            if self.stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-            // guard dropped here → unlock
+            if guard.poll_halted(Some(self.active_core)) {
+                self.stop_flag.store(true, Ordering::Relaxed);
+                break;
+            }
         }
+    }
+
+    /// 尝试恢复探针连接，最多 3 次，间隔 500ms。
+    /// 返回 true 表示恢复成功。
+    fn attempt_recovery(&mut self) -> bool {
+        let max_retries = self.retries_left.load(Ordering::Relaxed);
+        for attempt in 1..=max_retries {
+            std::thread::sleep(Duration::from_millis(500));
+            log::info!("sampler: recovery attempt {}/{}", attempt, max_retries);
+            let mut guard = match self.backend.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            match guard.try_recover() {
+                Ok(()) => {
+                    log::info!("sampler: recovery successful on attempt {}", attempt);
+                    return true;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "sampler: recovery attempt {}/{} failed: {e}",
+                        attempt,
+                        max_retries
+                    );
+                }
+            }
+        }
+        false
     }
 }
 

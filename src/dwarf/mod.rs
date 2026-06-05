@@ -81,7 +81,6 @@ impl DwarfResolver {
     }
 
     /// 根据地址查找函数名和偏移。
-    #[allow(dead_code)]
     pub fn addr_function(&self, addr: u32) -> Option<&str> {
         // 范围匹配：查找包含该地址的函数
         self.functions
