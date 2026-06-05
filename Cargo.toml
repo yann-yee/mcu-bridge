@@ -30,6 +30,10 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# DWARF 符号解析（已在 Cargo.lock 中，零新增下载）
+gimli = "0.32"
+object = "0.38"
+
 # 串口通信（UART 通道）
 serialport = "4.7"
 

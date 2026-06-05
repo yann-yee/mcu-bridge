@@ -5,6 +5,7 @@
 mod buffer;
 mod cli;
 mod config;
+mod dwarf;
 mod error;
 mod log;
 mod probe;
