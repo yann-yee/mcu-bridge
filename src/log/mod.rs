@@ -92,11 +92,15 @@ mod tests {
     use crate::probe::probe_rs::ProbeRsBackend;
 
     /// 验证 detect_log_backend 在无硬件时返回 None（而非 panic）。
+    ///
+    /// 传入一个不存在的串口路径（`NONEXISTENT`）以避免 auto_detect
+    /// 在 Windows CI 上枚举到真实 COM 端口导致 UART 成功打开。
     #[test]
     fn test_detect_fallback_all_fail() {
         let backend: Box<dyn DebugProbe> = Box::new(ProbeRsBackend::new());
         let backend = Arc::new(Mutex::new(backend));
-        let result = detect_log_backend(backend, None, 0);
+        // 传入显式不存在的端口名，绕开 auto_detect 的平台差异
+        let result = detect_log_backend(backend, Some("NONEXISTENT_PORT_FOR_TEST".into()), 0);
         assert!(
             result.is_none(),
             "should return None when no backend available"
@@ -108,7 +112,7 @@ mod tests {
     fn test_detect_fallback_type_safety() {
         let backend: Box<dyn DebugProbe> = Box::new(ProbeRsBackend::new());
         let backend = Arc::new(Mutex::new(backend));
-        let result = detect_log_backend(backend, None, 0);
+        let result = detect_log_backend(backend, Some("NONEXISTENT_PORT_FOR_TEST".into()), 0);
         // 类型安全：返回 Option<Box<dyn LogChannel>>，编译即证明类型正确
         assert!(result.is_none());
     }
