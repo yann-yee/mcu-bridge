@@ -186,8 +186,7 @@ impl Command {
                 if parts.len() < 2 {
                     return Err("usage: watch <addr>:<size>[:<label>]".into());
                 }
-                let (addr, size, label) =
-                    crate::buffer::DebugBuffer::parse_watch_spec(parts[1]).map_err(|e| e)?;
+                let (addr, size, label) = crate::buffer::DebugBuffer::parse_watch_spec(parts[1])?;
                 Ok(Self::Watch { addr, size, label })
             }
             "buffer" | "buff" => {
