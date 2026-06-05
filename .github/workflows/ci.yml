@@ -35,6 +35,14 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: clippy
+
+      # serialport 依赖 libudev-sys，需要系统 libudev
+      - name: install Linux system deps (libudev)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
