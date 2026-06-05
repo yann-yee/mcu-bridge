@@ -69,6 +69,7 @@ fn main() -> anyhow::Result<()> {
             sampling_interval,
             serial_port,
             chip,
+            openocd_cfg,
         } => {
             cli::debug::handle(&cli::debug::DebugArgs {
                 elf,
@@ -85,6 +86,7 @@ fn main() -> anyhow::Result<()> {
                 halt_on_start,
                 sampling_interval,
                 serial_port,
+                openocd_cfg,
             })?;
         }
     }

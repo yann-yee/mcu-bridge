@@ -113,5 +113,8 @@ pub enum Commands {
         /// 覆盖串口端口
         #[arg(long)]
         serial_port: Option<String>,
+        /// OpenOCD 配置文件路径（仅 --backend openocd 时生效）
+        #[arg(long)]
+        openocd_cfg: Option<String>,
     },
 }

@@ -29,6 +29,18 @@ pub struct OpenOcdBackend {
     telnet: Option<TcpStream>,
     /// OpenOCD 配置文件路径（None 时尝试 .debugger/openocd.cfg）
     cfg_path: Option<String>,
+    /// 目标是否处于 halted 状态（Q2=A 关键）
+    target_halted: bool,
+    /// 断点 ID 计数器
+    next_bp_id: BpId,
+    /// 断点地址 → ID 映射
+    bp_map: HashMap<u64, BpId>,
+    /// watchpoint ID 计数器（P2 预留）
+    #[allow(dead_code)]
+    next_wp_id: WpId,
+    /// watchpoint 地址 → ID 映射（P2 预留）
+    #[allow(dead_code)]
+    wp_map: HashMap<u64, WpId>,
 }
 
 impl OpenOcdBackend {
@@ -41,6 +53,11 @@ impl OpenOcdBackend {
             process: None,
             telnet: None,
             cfg_path,
+            target_halted: false,
+            next_bp_id: 0,
+            bp_map: HashMap::new(),
+            next_wp_id: 0,
+            wp_map: HashMap::new(),
         }
     }
 
@@ -142,7 +159,7 @@ impl OpenOcdBackend {
             // 轮询等待子进程退出（最多 5 秒）
             for _ in 0..25 {
                 match child.try_wait() {
-                    Ok(Some(_)) => return, // 正常退出
+                    Ok(Some(_)) => break, // 正常退出
                     Ok(None) => std::thread::sleep(Duration::from_millis(200)),
                     Err(_) => break,
                 }
@@ -151,6 +168,13 @@ impl OpenOcdBackend {
             let _ = child.kill();
             let _ = child.wait();
         }
+
+        // 清空所有状态（支持 re-attach）
+        self.target_halted = false;
+        self.bp_map.clear();
+        self.wp_map.clear();
+        self.next_bp_id = 0;
+        self.next_wp_id = 0;
     }
 }
 
@@ -229,22 +253,39 @@ impl DebugProbe for OpenOcdBackend {
     }
 
     fn halt(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD halt not implemented for standalone flash")
+        let response = self.tcl_command("halt")?;
+        let response_lower = response.to_lowercase();
+        if response_lower.contains("error") || response_lower.contains("failed") {
+            anyhow::bail!("OpenOCD halt failed: {response}");
+        }
+        self.target_halted = true;
+        Ok(())
     }
 
     fn resume(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
-        // Standalone flash 场景：flash() 已用 program 命令完成烧录，
-        // 用 reset 命令让芯片复位运行（不经过 detach/exit）
-        let response = self.tcl_command("reset")?;
+        // Q2=A: halted 态发 resume，非 halted 态发 reset run（flash 场景兼容）
+        let cmd = if self.target_halted {
+            "resume"
+        } else {
+            "reset run"
+        };
+        let response = self.tcl_command(cmd)?;
         let response_lower = response.to_lowercase();
         if response_lower.contains("error") || response_lower.contains("failed") {
-            anyhow::bail!("OpenOCD resume failed: {response}");
+            anyhow::bail!("OpenOCD resume ({cmd}) failed: {response}");
         }
+        self.target_halted = false;
         Ok(())
     }
 
     fn step(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD step not implemented")
+        let response = self.tcl_command("step")?;
+        let response_lower = response.to_lowercase();
+        if response_lower.contains("error") || response_lower.contains("failed") {
+            anyhow::bail!("OpenOCD step failed: {response}");
+        }
+        self.target_halted = true;
+        Ok(())
     }
 
     fn core_count(&self) -> usize {
@@ -255,36 +296,239 @@ impl DebugProbe for OpenOcdBackend {
         0
     }
 
-    fn set_breakpoint(&mut self, _addr: u32, _core: Option<usize>) -> anyhow::Result<BpId> {
-        anyhow::bail!("P2: OpenOCD set_breakpoint not implemented")
+    fn set_breakpoint(&mut self, addr: u32, _core: Option<usize>) -> anyhow::Result<BpId> {
+        let addr = addr as u64;
+        // 先分配 ID，再操作硬件（先改 self、再借子对象模式）
+        let id = self.next_bp_id;
+        self.next_bp_id += 1;
+        self.bp_map.insert(addr, id);
+
+        let result = self.tcl_command(&format!("bp 0x{addr:x} 4 hw"));
+        match result {
+            Ok(response) => {
+                let response_lower = response.to_lowercase();
+                if response_lower.contains("error") || response_lower.contains("failed") {
+                    // 回滚
+                    self.bp_map.remove(&addr);
+                    self.next_bp_id -= 1;
+                    anyhow::bail!("OpenOCD set_breakpoint at 0x{addr:x} failed: {response}");
+                }
+                Ok(id)
+            }
+            Err(e) => {
+                // 回滚
+                self.bp_map.remove(&addr);
+                self.next_bp_id -= 1;
+                Err(anyhow::anyhow!(
+                    "OpenOCD set_breakpoint at 0x{addr:x} failed: {e}"
+                ))
+            }
+        }
     }
 
-    fn clear_breakpoint(&mut self, _id: BpId) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD clear_breakpoint not implemented")
+    fn clear_breakpoint(&mut self, id: BpId) -> anyhow::Result<()> {
+        // 从 bp_map 反查地址
+        let addr = self
+            .bp_map
+            .iter()
+            .find(|&(_, bid)| *bid == id)
+            .map(|(&a, _)| a)
+            .ok_or_else(|| anyhow::anyhow!("breakpoint #{id} not found"))?;
+
+        let response = self.tcl_command(&format!("rbp 0x{addr:x}"))?;
+        let response_lower = response.to_lowercase();
+        if response_lower.contains("error") || response_lower.contains("failed") {
+            anyhow::bail!("OpenOCD clear_breakpoint #{id} at 0x{addr:x} failed: {response}");
+        }
+        self.bp_map.retain(|&a, _| a != addr);
+        Ok(())
     }
 
-    fn set_watchpoint(&mut self, _addr: u32, _len: u32, _kind: WatchKind) -> anyhow::Result<WpId> {
-        anyhow::bail!("P2: OpenOCD watchpoint not implemented")
+    fn set_watchpoint(&mut self, addr: u32, len: u32, kind: WatchKind) -> anyhow::Result<WpId> {
+        let addr = addr as u64;
+        let flag = match kind {
+            WatchKind::Read => "r",
+            WatchKind::Write => "w",
+            WatchKind::ReadWrite => "a",
+        };
+        let id = self.next_wp_id;
+        self.next_wp_id += 1;
+        self.wp_map.insert(addr, id);
+
+        let cmd = format!("wp 0x{addr:x} {len} {flag}");
+        match self.tcl_command(&cmd) {
+            Ok(response) => {
+                let l = response.to_lowercase();
+                if l.contains("error") || l.contains("failed") {
+                    self.wp_map.remove(&addr);
+                    self.next_wp_id -= 1;
+                    anyhow::bail!("OpenOCD set_watchpoint at 0x{addr:x} failed: {response}");
+                }
+                Ok(id)
+            }
+            Err(e) => {
+                self.wp_map.remove(&addr);
+                self.next_wp_id -= 1;
+                Err(anyhow::anyhow!(
+                    "OpenOCD set_watchpoint at 0x{addr:x} failed: {e}"
+                ))
+            }
+        }
     }
 
-    fn clear_watchpoint(&mut self, _id: WpId) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD clear_watchpoint not implemented")
+    fn clear_watchpoint(&mut self, id: WpId) -> anyhow::Result<()> {
+        let addr = self
+            .wp_map
+            .iter()
+            .find(|&(_, wid)| *wid == id)
+            .map(|(&a, _)| a)
+            .ok_or_else(|| anyhow::anyhow!("watchpoint #{id} not found"))?;
+
+        let response = self.tcl_command(&format!("rwp 0x{addr:x}"))?;
+        let l = response.to_lowercase();
+        if l.contains("error") || l.contains("failed") {
+            anyhow::bail!("OpenOCD clear_watchpoint #{id} at 0x{addr:x} failed: {response}");
+        }
+        self.wp_map.retain(|&a, _| a != addr);
+        Ok(())
     }
 
-    fn read_mem(&mut self, _addr: u32, _len: u32, _core: Option<usize>) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("P2: OpenOCD read_mem not implemented")
+    fn read_mem(&mut self, addr: u32, len: u32, _core: Option<usize>) -> anyhow::Result<Vec<u8>> {
+        // OpenOCD 以 word (32-bit) 为单位读内存
+        let count = (len + 3) / 4;
+        let cmd = format!("read_memory 0x{addr:x} 32 {count}");
+        let response = self.tcl_command(&cmd)?;
+
+        // 解析 Tcl 返回的 word 列表:
+        // 格式1: 每个 word 单独一行
+        // 格式2: {word1 word2 ...} 花括号括起的列表
+        // 去掉花括号
+        let cleaned = response
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}');
+
+        let mut result = Vec::with_capacity(len as usize);
+        for token in cleaned.split_whitespace() {
+            if token.is_empty() {
+                continue;
+            }
+            // 可能带 0x 前缀
+            let val = if let Some(hex) = token
+                .strip_prefix("0x")
+                .or_else(|| token.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16)
+            } else {
+                token.parse::<u32>()
+            };
+            match val {
+                Ok(word) => {
+                    result.extend_from_slice(&word.to_le_bytes());
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+            if result.len() >= len as usize {
+                break;
+            }
+        }
+        result.truncate(len as usize);
+        Ok(result)
     }
 
-    fn write_mem(&mut self, _addr: u32, _data: &[u8], _core: Option<usize>) -> anyhow::Result<()> {
-        anyhow::bail!("P2: OpenOCD write_mem not implemented")
+    fn write_mem(&mut self, addr: u32, data: &[u8], _core: Option<usize>) -> anyhow::Result<()> {
+        // 将 data 按 4 字节对齐并拆分为 u32 列表
+        let words: Vec<String> = data
+            .chunks(4)
+            .map(|chunk| {
+                let mut buf = [0u8; 4];
+                buf[..chunk.len()].copy_from_slice(chunk);
+                let word = u32::from_le_bytes(buf);
+                format!("0x{word:x}")
+            })
+            .collect();
+
+        let cmd = format!("write_memory 0x{addr:x} 32 {{{}}}", words.join(" "));
+        let response = self.tcl_command(&cmd)?;
+        let response_lower = response.to_lowercase();
+        if response_lower.contains("error") || response_lower.contains("failed") {
+            anyhow::bail!("OpenOCD write_mem at 0x{addr:x} failed: {response}");
+        }
+        Ok(())
     }
 
     fn read_regs(&mut self, _core: Option<usize>) -> anyhow::Result<HashMap<String, u64>> {
-        anyhow::bail!("P2: OpenOCD read_regs not implemented")
+        let response = self.tcl_command("reg")?;
+        let mut map = HashMap::new();
+
+        for line in response.lines() {
+            let trimmed = line.trim();
+            // 匹配格式: "(n) name (/bits): 0xVALUE" 或 "(n) name (/bits): 0xVALUE (dirty)"
+            if !trimmed.starts_with('(') {
+                continue;
+            }
+            // 去掉开头的括号编号
+            let after_paren = match trimmed.find(')') {
+                Some(idx) => &trimmed[idx + 1..],
+                None => continue,
+            };
+            let parts: Vec<&str> = after_paren.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let name_part = parts[0].trim();
+            let value_part = parts[1].trim();
+
+            // 提取寄存器名（去掉括号中的比特数部分）
+            let name = match name_part.find(" (") {
+                Some(idx) => name_part[..idx].trim(),
+                None => name_part,
+            };
+            if name.is_empty() {
+                continue;
+            }
+
+            // 提取值（可能含 " (dirty)" 后缀）
+            let val_str = value_part.split_whitespace().next().unwrap_or("");
+            let val = if let Some(hex) = val_str
+                .strip_prefix("0x")
+                .or_else(|| val_str.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                val_str.parse::<u64>().ok()
+            };
+
+            if let Some(v) = val {
+                map.insert(name.to_string(), v);
+            }
+        }
+
+        Ok(map)
     }
 
     fn is_halted(&mut self, _core: Option<usize>) -> bool {
-        false
+        self.target_halted
+    }
+
+    fn poll_halted(&mut self, _core: Option<usize>) -> bool {
+        if self.target_halted {
+            return true;
+        }
+        // 用 1ms 短超时轮询目标是否刚刚 halt
+        match self.tcl_command("wait_halt 1") {
+            Ok(resp) => {
+                let l = resp.to_lowercase();
+                if !l.contains("error") && !l.contains("failed") && !l.contains("timeout") {
+                    self.target_halted = true;
+                    return true;
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -296,12 +540,14 @@ mod tests {
     /// 验证后端创建时的初始状态。
     #[test]
     fn test_openocd_creation() {
-        let backend = OpenOcdBackend::new(None);
+        let mut backend = OpenOcdBackend::new(None);
         assert!(!backend.is_connected());
         assert_eq!(backend.core_count(), 1);
+        assert_eq!(backend.active_core(), 0);
+        assert!(!backend.is_halted(None));
     }
 
-    /// 配置文件不存在时返回 Err(E_PARAM)。
+    /// 配置文件不存在时返回 Err。
     #[test]
     fn test_openocd_attach_no_cfg() {
         let mut backend = OpenOcdBackend::new(Some("nonexistent.cfg".into()));
@@ -319,5 +565,103 @@ mod tests {
             msg.contains("cfg file not found"),
             "Expected cfg not found, got: {msg}"
         );
+    }
+
+    /// 未连接时 halt 应返回 Err。
+    #[test]
+    fn test_openocd_halt_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.halt(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// 未连接时 step 应返回 Err。
+    #[test]
+    fn test_openocd_step_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.step(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// 未连接时 resume 应返回 Err。
+    #[test]
+    fn test_openocd_resume_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.resume(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// 未连接时 set_breakpoint 应返回 Err。
+    #[test]
+    fn test_openocd_set_breakpoint_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.set_breakpoint(0x08000100, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// clear_breakpoint 不存在的 ID 应返回 Err。
+    #[test]
+    fn test_openocd_clear_breakpoint_not_found() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.clear_breakpoint(42).unwrap_err();
+        assert!(
+            err.to_string().contains("breakpoint #42 not found"),
+            "Expected 'breakpoint not found', got: {err}"
+        );
+    }
+
+    /// 未连接时 read_mem 应返回 Err。
+    #[test]
+    fn test_openocd_read_mem_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.read_mem(0x20000000, 16, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// 未连接时 read_regs 应返回 Err。
+    #[test]
+    fn test_openocd_read_regs_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        let err = backend.read_regs(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "Expected 'not connected', got: {err}"
+        );
+    }
+
+    /// detach 在未连接状态下应是安全的（幂等）。
+    #[test]
+    fn test_openocd_detach_is_idempotent() {
+        let mut backend = OpenOcdBackend::new(None);
+        assert!(backend.detach().is_ok());
+        assert!(backend.detach().is_ok());
+    }
+
+    /// set_watchpoint 未连接时返回 Err。
+    #[test]
+    fn test_openocd_watchpoint_without_attach() {
+        let mut backend = OpenOcdBackend::new(None);
+        use crate::probe::WatchKind;
+        assert!(
+            backend
+                .set_watchpoint(0x20000000, 4, WatchKind::ReadWrite)
+                .is_err()
+        );
+        assert!(backend.clear_watchpoint(0).is_err());
     }
 }

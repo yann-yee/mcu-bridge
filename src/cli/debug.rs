@@ -45,6 +45,7 @@ pub struct DebugArgs {
     pub halt_on_start: bool,
     pub sampling_interval: Option<u64>,
     pub serial_port: Option<String>,
+    pub openocd_cfg: Option<String>,
 }
 
 /// REPL 命令枚举
@@ -694,21 +695,29 @@ fn resolve_chip_and_flash_opts(
 }
 
 /// 创建调试后端（根据 `--backend` CLI 参数）。
-fn create_debug_backend(backend_arg: &Option<String>) -> anyhow::Result<Box<dyn DebugProbe>> {
+fn create_debug_backend(
+    backend_arg: &Option<String>,
+    openocd_cfg: &Option<String>,
+) -> anyhow::Result<Box<dyn DebugProbe>> {
     let backend_type = backend_arg.as_deref().unwrap_or("probe-rs");
     match backend_type.to_ascii_lowercase().as_str() {
         "probe-rs" => Ok(Box::new(ProbeRsBackend::new())),
         "openocd" => {
-            let cfg_path = Path::new(".debugger/openocd.cfg");
-            if cfg_path.exists() {
-                Ok(Box::new(OpenOcdBackend::new(Some(
-                    cfg_path.to_string_lossy().to_string(),
-                ))))
-            } else {
-                anyhow::bail!(
-                    "OpenOCD backend requires .debugger/openocd.cfg. \
-                     Create one or use 'mcu-bridge init --debugger openocd'"
-                )
+            // 优先级: --openocd-cfg CLI > .debugger/openocd.cfg 兜底
+            let cfg_path = openocd_cfg.clone().or_else(|| {
+                let default_path = Path::new(".debugger/openocd.cfg");
+                if default_path.exists() {
+                    Some(default_path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
+            match cfg_path {
+                Some(path) => Ok(Box::new(OpenOcdBackend::new(Some(path)))),
+                None => anyhow::bail!(
+                    "OpenOCD backend requires a config file. \
+                     Use --openocd-cfg <PATH> or create .debugger/openocd.cfg"
+                ),
             }
         }
         _ => anyhow::bail!("unknown backend '{backend_type}'. Supported: probe-rs, openocd"),
@@ -726,7 +735,7 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     let (chip, flash_opts) = resolve_chip_and_flash_opts(&args.chip)?;
 
     // 创建后端
-    let backend = create_debug_backend(&args.backend)?;
+    let backend = create_debug_backend(&args.backend, &args.openocd_cfg)?;
 
     // 连接并创建会话
     let mut session = Session::attach(&chip, backend)?;
@@ -1008,6 +1017,7 @@ mod tests {
             halt_on_start: false,
             sampling_interval: None,
             serial_port: None,
+            openocd_cfg: None,
         };
         let err = handle(&args).unwrap_err();
         let msg = err.to_string();
@@ -1036,6 +1046,7 @@ mod tests {
             halt_on_start: false,
             sampling_interval: None,
             serial_port: None,
+            openocd_cfg: None,
         };
         let err = handle(&args).unwrap_err();
         let msg = err.to_string();
@@ -1064,6 +1075,7 @@ mod tests {
             halt_on_start: false,
             sampling_interval: None,
             serial_port: None,
+            openocd_cfg: None,
         };
         let err = handle(&args).unwrap_err();
         let msg = err.to_string();
@@ -1077,12 +1089,12 @@ mod tests {
 
     #[test]
     fn test_create_backend_probe_rs_default() {
-        assert!(create_debug_backend(&None).is_ok());
+        assert!(create_debug_backend(&None, &None).is_ok());
     }
 
     #[test]
     fn test_create_backend_unknown() {
-        let result = create_debug_backend(&Some("invalid".into()));
+        let result = create_debug_backend(&Some("invalid".into()), &None);
         assert!(result.is_err());
         // 验证错误信息 (通过 to_string 获取)
         let err_msg = match result {
