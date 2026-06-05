@@ -56,9 +56,11 @@ fn build_dwarf_from_file<'data>(
     };
 
     let dwarf_result: Result<gimli::Dwarf<EndianSlice<'data, RunTimeEndian>>, gimli::Error> =
-        gimli::Dwarf::load(|section_id| -> Result<EndianSlice<'data, RunTimeEndian>, gimli::Error> {
-            Ok(load_section(section_id))
-        });
+        gimli::Dwarf::load(
+            |section_id| -> Result<EndianSlice<'data, RunTimeEndian>, gimli::Error> {
+                Ok(load_section(section_id))
+            },
+        );
     dwarf_result.map_err(|e| anyhow::anyhow!("failed to load DWARF sections: {e}"))
 }
 

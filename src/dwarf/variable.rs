@@ -8,9 +8,7 @@ use crate::dwarf::types::VariableInfo;
 type Reader<'a> = EndianSlice<'a, gimli::RunTimeEndian>;
 
 /// 从 DWARF 中收集所有全局/静态变量信息。
-pub(crate) fn collect_variables(
-    dwarf: &gimli::Dwarf<Reader>,
-) -> anyhow::Result<Vec<VariableInfo>> {
+pub(crate) fn collect_variables(dwarf: &gimli::Dwarf<Reader>) -> anyhow::Result<Vec<VariableInfo>> {
     let mut variables = Vec::new();
     let mut iter = dwarf.units();
     while let Some(header) = iter
@@ -77,9 +75,7 @@ fn get_string_attr(
 }
 
 /// 从 DW_AT_location 提取全局变量绝对地址（仅支持 DW_OP_addr）。
-fn get_global_addr(
-    entry: &gimli::DebuggingInformationEntry<Reader>,
-) -> Option<u64> {
+fn get_global_addr(entry: &gimli::DebuggingInformationEntry<Reader>) -> Option<u64> {
     let attr = entry.attr(gimli::DW_AT_location).ok()??;
     match attr.value() {
         gimli::AttributeValue::Exprloc(ref expr) => {
@@ -91,12 +87,21 @@ fn get_global_addr(
             let addr_bytes = &bytes[1..];
             if addr_bytes.len() == 4 {
                 Some(u64::from(u32::from_ne_bytes([
-                    addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3],
+                    addr_bytes[0],
+                    addr_bytes[1],
+                    addr_bytes[2],
+                    addr_bytes[3],
                 ])))
             } else if addr_bytes.len() == 8 {
                 Some(u64::from_ne_bytes([
-                    addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3],
-                    addr_bytes[4], addr_bytes[5], addr_bytes[6], addr_bytes[7],
+                    addr_bytes[0],
+                    addr_bytes[1],
+                    addr_bytes[2],
+                    addr_bytes[3],
+                    addr_bytes[4],
+                    addr_bytes[5],
+                    addr_bytes[6],
+                    addr_bytes[7],
                 ]))
             } else {
                 None

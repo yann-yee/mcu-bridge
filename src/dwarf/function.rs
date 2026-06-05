@@ -8,9 +8,7 @@ use crate::dwarf::types::FunctionInfo;
 type Reader<'a> = EndianSlice<'a, gimli::RunTimeEndian>;
 
 /// 从 DWARF 中收集所有函数信息。
-pub(crate) fn collect_functions(
-    dwarf: &gimli::Dwarf<Reader>,
-) -> anyhow::Result<Vec<FunctionInfo>> {
+pub(crate) fn collect_functions(dwarf: &gimli::Dwarf<Reader>) -> anyhow::Result<Vec<FunctionInfo>> {
     let mut functions = Vec::new();
     let mut iter = dwarf.units();
     while let Some(header) = iter

@@ -87,9 +87,7 @@ pub enum Command {
         channel: Option<String>,
     },
     /// 查询符号信息（DWARF）
-    Info {
-        subcmd: InfoSubcmd,
-    },
+    Info { subcmd: InfoSubcmd },
 }
 
 /// info 子命令
@@ -311,10 +309,12 @@ impl Command {
             Self::Resume | Self::Step | Self::Break { .. } | Self::Regs | Self::Mem { .. } => {
                 Some(&[SessionState::Halted])
             }
-            Self::Status | Self::Help | Self::Quit | Self::Buffer { .. } | Self::Serial { .. }
-            | Self::Info { .. } => {
-                None
-            }
+            Self::Status
+            | Self::Help
+            | Self::Quit
+            | Self::Buffer { .. }
+            | Self::Serial { .. }
+            | Self::Info { .. } => None,
             Self::Watch { .. } => Some(&[SessionState::Halted]),
         }
     }
@@ -335,7 +335,10 @@ fn parse_u32(s: &str) -> Result<u32, std::num::ParseIntError> {
 /// - `0x20000000:4:label` — 地址:大小:标签
 /// - `adc_val` — 变量名（自动推导大小）
 /// - `adc_val:2` — 变量名:覆盖大小
-fn resolve_watch_spec(spec: &str, dwarf: Option<&DwarfResolver>) -> Result<(u32, u32, Option<String>), String> {
+fn resolve_watch_spec(
+    spec: &str,
+    dwarf: Option<&DwarfResolver>,
+) -> Result<(u32, u32, Option<String>), String> {
     let colons: Vec<&str> = spec.split(':').collect();
 
     // 尝试将第一段解析为十六进制地址
@@ -346,12 +349,17 @@ fn resolve_watch_spec(spec: &str, dwarf: Option<&DwarfResolver>) -> Result<(u32,
                 .parse::<u32>()
                 .map_err(|_| format!("invalid size: '{}'. Use decimal.", colons[1]))?
         } else {
-            return Err("watch spec requires size when using hex address, e.g. 0x20000000:4".into());
+            return Err(
+                "watch spec requires size when using hex address, e.g. 0x20000000:4".into(),
+            );
         };
         if !matches!(size, 1 | 2 | 4 | 8) {
             return Err(format!("watch size must be 1, 2, 4, or 8, got {size}"));
         }
-        let label = colons.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        let label = colons
+            .get(2)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         return Ok((addr, size, label));
     }
 
@@ -636,7 +644,13 @@ impl DebugRepl {
                 }
                 println!("Functions ({}):", funcs.len());
                 for f in funcs {
-                    println!("  {:<30} 0x{:08x}..0x{:08x} ({} bytes)", f.name, f.low_addr, f.high_addr, f.high_addr - f.low_addr);
+                    println!(
+                        "  {:<30} 0x{:08x}..0x{:08x} ({} bytes)",
+                        f.name,
+                        f.low_addr,
+                        f.high_addr,
+                        f.high_addr - f.low_addr
+                    );
                 }
             }
             InfoSubcmd::Variables => {
@@ -951,6 +965,26 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     let (log_event_tx, log_event_rx) = mpsc::channel();
 
     // 路由到对应界面
+    // 加载 DWARF 符号信息（如果 ELF 可用）
+    let dwarf = if args.elf.as_os_str().is_empty() {
+        None
+    } else {
+        match DwarfResolver::from_elf(&args.elf) {
+            Ok(d) => {
+                log::info!(
+                    "DWARF loaded: {} functions, {} variables",
+                    d.function_count(),
+                    d.variable_count()
+                );
+                Some(d)
+            }
+            Err(e) => {
+                log::warn!("failed to load DWARF from '{}': {e}", args.elf.display());
+                None
+            }
+        }
+    };
+
     if args.json {
         let shared_backend = session.shared_backend();
         let mut js = JsonSession::new(
@@ -959,6 +993,7 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
             buffer_capacity,
             log_buffer.clone(),
             Some(log_event_rx),
+            dwarf,
         );
 
         // JSON 模式：尝试检测日志后端并启动 SerialMonitor
@@ -975,22 +1010,6 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
             js.run()?;
         }
     } else {
-        // 加载 DWARF 符号信息（如果 ELF 可用）
-        let dwarf = if args.elf.as_os_str().is_empty() {
-            None
-        } else {
-            match DwarfResolver::from_elf(&args.elf) {
-                Ok(d) => {
-                    log::info!("DWARF loaded: {} functions, {} variables", d.function_count(), d.variable_count());
-                    Some(d)
-                }
-                Err(e) => {
-                    log::warn!("failed to load DWARF from '{}': {e}", args.elf.display());
-                    None
-                }
-            }
-        };
-
         let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity, dwarf);
 
         // 处理 --watch 参数（启动时添加观测目标）

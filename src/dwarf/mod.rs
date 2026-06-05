@@ -48,10 +48,7 @@ impl DwarfResolver {
     }
 
     /// 从已提取的索引数据构建解析器（主要用于测试）。
-    fn build(
-        functions: Vec<FunctionInfo>,
-        variables: Vec<VariableInfo>,
-    ) -> anyhow::Result<Self> {
+    fn build(functions: Vec<FunctionInfo>, variables: Vec<VariableInfo>) -> anyhow::Result<Self> {
         let mut function_by_name: HashMap<String, Vec<u32>> = HashMap::new();
         let mut name_by_function_addr: HashMap<u32, String> = HashMap::new();
 

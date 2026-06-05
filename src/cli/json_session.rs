@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 
 use serde::Deserialize;
+
+use crate::cli::debug::InfoSubcmd;
+use crate::dwarf::DwarfResolver;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -110,12 +113,19 @@ fn generate_schema() -> SchemaData {
         },
         CommandMeta {
             name: "break".into(),
-            description: "Set hardware breakpoint".into(),
-            args: Some(vec![ArgMeta {
-                name: "addr".into(),
-                arg_type: "u32".into(),
-                required: true,
-            }]),
+            description: "Set hardware breakpoint (use addr or name)".into(),
+            args: Some(vec![
+                ArgMeta {
+                    name: "addr".into(),
+                    arg_type: "u32".into(),
+                    required: false,
+                },
+                ArgMeta {
+                    name: "name".into(),
+                    arg_type: "string".into(),
+                    required: false,
+                },
+            ]),
             valid_states: vec!["Halted".into()],
         },
         CommandMeta {
@@ -167,17 +177,22 @@ fn generate_schema() -> SchemaData {
         },
         CommandMeta {
             name: "watch".into(),
-            description: "Add a memory watch target".into(),
+            description: "Add a memory watch target (use addr or name)".into(),
             args: Some(vec![
                 ArgMeta {
                     name: "addr".into(),
                     arg_type: "u32".into(),
-                    required: true,
+                    required: false,
+                },
+                ArgMeta {
+                    name: "name".into(),
+                    arg_type: "string".into(),
+                    required: false,
                 },
                 ArgMeta {
                     name: "size".into(),
                     arg_type: "u32".into(),
-                    required: true,
+                    required: false,
                 },
                 ArgMeta {
                     name: "label".into(),
@@ -219,6 +234,16 @@ fn generate_schema() -> SchemaData {
                     required: false,
                 },
             ]),
+            valid_states: vec![],
+        },
+        CommandMeta {
+            name: "info".into(),
+            description: "Query DWARF symbol information".into(),
+            args: Some(vec![ArgMeta {
+                name: "subcmd".into(),
+                arg_type: "string".into(),
+                required: true,
+            }]),
             valid_states: vec![],
         },
     ];
@@ -270,7 +295,10 @@ fn generate_schema() -> SchemaData {
 /// 将 JSON 请求映射为 Command。
 ///
 /// 返回 `Ok(Command)` 可执行；返回 `Err(JsonResponse)` 可直接发送给客户端。
-pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
+pub fn json_to_command(
+    req: &JsonRequest,
+    dwarf: Option<&DwarfResolver>,
+) -> Result<Command, JsonResponse> {
     let err_response = |code: &str, msg: String| -> JsonResponse {
         JsonResponse {
             id: req.id,
@@ -288,17 +316,23 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
         "resume" => Ok(Command::Resume),
         "step" => Ok(Command::Step),
         "break" => {
-            let addr = req
-                .args
-                .get("addr")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| {
-                    err_response(
-                        "E_PARAM",
-                        "missing or invalid 'addr' (hex or decimal)".into(),
-                    )
-                })?;
+            let addr = if let Some(name) = req.args.get("name").and_then(|v| v.as_str()) {
+                // 名称优先
+                dwarf.and_then(|d| d.function_addr(name)).ok_or_else(|| {
+                    err_response("E_PARAM", format!("function '{}' not found in DWARF", name))
+                })?
+            } else {
+                req.args
+                    .get("addr")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .ok_or_else(|| {
+                        err_response(
+                            "E_PARAM",
+                            "missing or invalid 'addr' (hex or decimal)".into(),
+                        )
+                    })?
+            };
             Ok(Command::Break { addr })
         }
         "regs" => Ok(Command::Regs),
@@ -329,22 +363,45 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
         "quit" => Ok(Command::Quit),
         "schema" => unreachable!(), // handled in handle_request before json_to_command
         "watch" => {
-            let addr = req
-                .args
-                .get("addr")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'addr'".into()))?;
-            let size = req
-                .args
-                .get("size")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'size'".into()))?;
-            let label = req
-                .args
-                .get("label")
-                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            let (addr, size, label) = if let Some(name) =
+                req.args.get("name").and_then(|v| v.as_str())
+            {
+                let var = dwarf
+                    .and_then(|d| d.variable_info(name).cloned())
+                    .ok_or_else(|| {
+                        err_response("E_PARAM", format!("variable '{}' not found in DWARF", name))
+                    })?;
+                let size = req
+                    .args
+                    .get("size")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(var.size);
+                let label = req
+                    .args
+                    .get("label")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .or_else(|| Some(name.to_string()));
+                (var.addr, size, label)
+            } else {
+                let addr = req
+                    .args
+                    .get("addr")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'addr'".into()))?;
+                let size = req
+                    .args
+                    .get("size")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'size'".into()))?;
+                let label = req
+                    .args
+                    .get("label")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                (addr, size, label)
+            };
             if !matches!(size, 1 | 2 | 4 | 8) {
                 return Err(err_response("E_PARAM", "size must be 1, 2, 4, or 8".into()));
             }
@@ -366,6 +423,20 @@ pub fn json_to_command(req: &JsonRequest) -> Result<Command, JsonResponse> {
                 .get("channel")
                 .and_then(|v| v.as_str().map(|s| s.to_string()));
             Ok(Command::Serial { since, channel })
+        }
+        "info" => {
+            let subcmd = match req.args.get("subcmd").and_then(|v| v.as_str()) {
+                Some("functions") | Some("funcs") => InfoSubcmd::Functions,
+                Some("variables") | Some("vars") => InfoSubcmd::Variables,
+                Some(name) => InfoSubcmd::Symbol(name.to_string()),
+                None => {
+                    return Err(err_response(
+                        "E_PARAM",
+                        "missing 'subcmd' (functions|variables)".into(),
+                    ));
+                }
+            };
+            Ok(Command::Info { subcmd })
         }
         unknown => Err(err_response(
             "E_PARAM",
@@ -392,6 +463,8 @@ pub struct JsonSession {
     sampler_stop: Option<Arc<AtomicBool>>,
     /// 采样间隔（ms）
     sampling_interval: u64,
+    /// DWARF 符号解析器
+    dwarf: Option<DwarfResolver>,
 }
 
 impl JsonSession {
@@ -402,6 +475,7 @@ impl JsonSession {
         buffer_capacity: usize,
         log_buffer: Arc<RwLock<LogBuffer>>,
         log_event_rx: Option<mpsc::Receiver<LogEvent>>,
+        dwarf: Option<DwarfResolver>,
     ) -> Self {
         Self {
             session,
@@ -411,6 +485,7 @@ impl JsonSession {
             sampler_thread: None,
             sampler_stop: None,
             sampling_interval,
+            dwarf,
         }
     }
 
@@ -469,7 +544,7 @@ impl JsonSession {
         }
 
         // 映射为 Command
-        let cmd = match json_to_command(&req) {
+        let cmd = match json_to_command(&req, self.dwarf.as_ref()) {
             Ok(c) => c,
             Err(err_resp) => {
                 Self::send_json(&err_resp);
@@ -691,8 +766,70 @@ impl JsonSession {
                     "count": filtered.len(),
                 })))
             }
-            Command::Info { .. } => {
-                Ok(Some(json!({"status": "error", "error": "info not available in JSON-Lines mode"})))
+            Command::Info { subcmd } => {
+                let dwarf = match self.dwarf.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        return Ok(Some(
+                            json!({"status": "error", "error": "no DWARF info available"}),
+                        ));
+                    }
+                };
+                match subcmd {
+                    InfoSubcmd::Functions => {
+                        let funcs = dwarf.list_functions();
+                        Ok(Some(json!({
+                            "status": "ok",
+                            "subcmd": "functions",
+                            "count": funcs.len(),
+                            "functions": funcs.iter().map(|f| json!({
+                                "name": f.name,
+                                "low_addr": f.low_addr,
+                                "high_addr": f.high_addr,
+                                "size": f.high_addr - f.low_addr,
+                            })).collect::<Vec<_>>(),
+                        })))
+                    }
+                    InfoSubcmd::Variables => {
+                        let vars = dwarf.list_variables();
+                        Ok(Some(json!({
+                            "status": "ok",
+                            "subcmd": "variables",
+                            "count": vars.len(),
+                            "variables": vars.iter().map(|v| json!({
+                                "name": v.name,
+                                "addr": v.addr,
+                                "size": v.size,
+                                "type_name": v.type_name,
+                            })).collect::<Vec<_>>(),
+                        })))
+                    }
+                    InfoSubcmd::Symbol(name) => {
+                        // 查询函数
+                        if let Some(addr) = dwarf.function_addr(&name) {
+                            return Ok(Some(json!({
+                                "status": "ok",
+                                "kind": "function",
+                                "name": name,
+                                "addr": addr,
+                            })));
+                        }
+                        // 查询变量
+                        if let Some(var) = dwarf.variable_info(&name) {
+                            return Ok(Some(json!({
+                                "status": "ok",
+                                "kind": "variable",
+                                "name": var.name,
+                                "addr": var.addr,
+                                "size": var.size,
+                            })));
+                        }
+                        Ok(Some(json!({
+                            "status": "error",
+                            "error": format!("symbol '{}' not found in DWARF", name),
+                        })))
+                    }
+                }
             }
         }
     }
@@ -812,6 +949,11 @@ impl JsonSession {
 mod tests {
     use super::*;
 
+    /// 测试用 json_to_command 包装，默认无 DWARF 解析器。
+    fn jc(req: &JsonRequest) -> Result<Command, JsonResponse> {
+        json_to_command(req, None)
+    }
+
     // ── json_to_command 映射测试 ──
 
     #[test]
@@ -821,7 +963,7 @@ mod tests {
             args: HashMap::new(),
             id: 1,
         };
-        assert!(matches!(json_to_command(&req).unwrap(), Command::Halt));
+        assert!(matches!(jc(&req).unwrap(), Command::Halt));
     }
 
     #[test]
@@ -831,7 +973,7 @@ mod tests {
             args: HashMap::new(),
             id: 1,
         };
-        assert!(matches!(json_to_command(&req).unwrap(), Command::Resume));
+        assert!(matches!(jc(&req).unwrap(), Command::Resume));
     }
 
     #[test]
@@ -841,7 +983,7 @@ mod tests {
             args: HashMap::new(),
             id: 1,
         };
-        assert!(matches!(json_to_command(&req).unwrap(), Command::Step));
+        assert!(matches!(jc(&req).unwrap(), Command::Step));
     }
 
     #[test]
@@ -853,7 +995,7 @@ mod tests {
             args,
             id: 1,
         };
-        let cmd = json_to_command(&req).unwrap();
+        let cmd = jc(&req).unwrap();
         assert_eq!(cmd, Command::Break { addr: 0x08000100 });
     }
 
@@ -864,7 +1006,7 @@ mod tests {
             args: HashMap::new(),
             id: 1,
         };
-        let err = json_to_command(&req).unwrap_err();
+        let err = jc(&req).unwrap_err();
         assert_eq!(err.status, "error");
         assert_eq!(err.error.as_ref().unwrap().code, "E_PARAM");
     }
@@ -876,7 +1018,7 @@ mod tests {
             args: HashMap::new(),
             id: 1,
         };
-        let err = json_to_command(&req).unwrap_err();
+        let err = jc(&req).unwrap_err();
         assert_eq!(err.error.as_ref().unwrap().code, "E_PARAM");
         assert!(err.error.unwrap().message.contains("unknown command"));
     }
@@ -891,7 +1033,7 @@ mod tests {
             args,
             id: 1,
         };
-        let cmd = json_to_command(&req).unwrap();
+        let cmd = jc(&req).unwrap();
         assert_eq!(
             cmd,
             Command::Mem {
@@ -910,7 +1052,7 @@ mod tests {
             args,
             id: 1,
         };
-        let err = json_to_command(&req).unwrap_err();
+        let err = jc(&req).unwrap_err();
         assert_eq!(err.error.as_ref().unwrap().code, "E_PARAM");
     }
 
@@ -919,8 +1061,8 @@ mod tests {
     #[test]
     fn test_schema_has_all_commands() {
         let schema = generate_schema();
-        // 13 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer, serial
-        assert_eq!(schema.commands.len(), 13);
+        // 14 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer, serial, info
+        assert_eq!(schema.commands.len(), 14);
     }
 
     #[test]
