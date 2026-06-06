@@ -1,0 +1,41 @@
+[chip]
+name = "STM32F411RE"
+architecture = "cortex-m4"
+flash_base = 134217728
+flash_size = 524288
+ram_base = 536870912
+ram_size = 131072
+
+[debugger]
+probe = "stlink-v2"
+interface = "swd"
+speed_khz = 4000
+backend = "probe-rs"
+
+[flash]
+base = 134217728
+size = 524288
+verify = true
+
+[[flash.sections]]
+name = "app"
+addr = 134217728
+len = 524288
+
+[serial]
+backend = "auto"
+port = "auto"
+baudrate = 115200
+rtt_channel = 0
+
+[watch]
+interval_ms = 10
+buffer_size = 128
+
+[recovery]
+max_retries = 3
+retry_delay_ms = 500
+
+[flash_bp]
+enabled = false
+max_per_session = 100

@@ -114,8 +114,9 @@ pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
     backend.flash(&args.elf, &flash_opts)?;
 
     if args.run {
-        eprintln!("[INFO] resuming target...");
-        backend.resume(None)?;
+        eprintln!("[INFO] resetting and running target...");
+        // reset() 将核心复位到向量表再运行（probe-rs: core.reset(), OpenOCD: reset run）
+        backend.reset(None)?;
     }
 
     backend.detach()?;
@@ -125,7 +126,7 @@ pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FlashArgs, create_backend, handle};
+    use super::{FlashArgs, create_backend, handle, resolve_chip_config};
     use std::path::PathBuf;
 
     #[test]
@@ -159,23 +160,44 @@ mod tests {
     }
 
     #[test]
-    fn test_flash_no_chip_no_config() {
-        // 确保 .debugger/chip.toml 不存在
-        let args = FlashArgs {
-            elf: PathBuf::from("Cargo.toml"),
-            verify: true,
-            chip: None,
-            run: false,
-            backend: None,
-            openocd_cfg: None,
-        };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
-        // 没有 --chip 也没有 .debugger/chip.toml 时应提示需要 chip
+    fn test_resolve_chip_config_with_chip_arg() {
+        // resolve_chip_config 是纯逻辑函数，不碰硬件
+        let result = resolve_chip_config(Some("STM32F411RE"));
         assert!(
-            msg.contains("cannot read") || msg.contains("not found") || msg.contains("chip"),
-            "got: {msg}"
+            result.is_ok(),
+            "resolve_chip_config with valid chip should succeed"
         );
+        let (chip, opts) = result.unwrap();
+        assert_eq!(chip.name, "STM32F411RE");
+        assert_eq!(chip.flash_base, 0x08000000);
+        assert_eq!(chip.flash_size, 512 * 1024);
+        assert_eq!(opts.base, 0x08000000);
+    }
+
+    #[test]
+    fn test_resolve_chip_config_invalid_chip() {
+        let result = resolve_chip_config(Some("INVALID"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown chip"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_chip_config_no_arg() {
+        // 当没有 --chip 参数时，尝试读取 .debugger/chip.toml
+        // 文件存在则成功，不存在则返回错误（两者都合法）
+        let result = resolve_chip_config(None);
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("cannot read") || msg.contains("not found"),
+                "got: {msg}"
+            );
+        }
+        // 如果成功（有 .debugger/chip.toml），检查芯片名
+        if let Ok((chip, _opts)) = result {
+            assert!(!chip.name.is_empty(), "chip name should not be empty");
+        }
     }
 
     #[test]

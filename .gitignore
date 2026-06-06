@@ -3,6 +3,7 @@ target/
 
 # Test firmware build artifacts
 test_firmware/*.elf
+test_firmware/*/build/
 
 # Environment file with API keys
 .env

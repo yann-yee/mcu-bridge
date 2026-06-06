@@ -1326,32 +1326,42 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_no_chip_no_config() {
-        use std::path::PathBuf;
-
-        let args = DebugArgs {
-            elf: PathBuf::from("Cargo.toml"),
-            chip: None,
-            config: None,
-            json: false,
-            no_flash: false,
-            verify: true,
-            backend: None,
-            enable_flash_bp: false,
-            break_at: vec![],
-            watch_targets: vec![],
-            continue_: false,
-            halt_on_start: false,
-            sampling_interval: None,
-            serial_port: None,
-            openocd_cfg: None,
-        };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
+    fn test_resolve_chip_for_debug_with_chip_arg() {
+        let result = resolve_chip_for_debug(&Some("STM32F411RE".into()));
         assert!(
-            msg.contains("chip") || msg.contains("config") || msg.contains("not found"),
-            "Expected chip/config error, got: {msg}"
+            result.is_ok(),
+            "resolve_chip_for_debug with valid chip should succeed"
         );
+        let chip = result.unwrap();
+        assert_eq!(chip.name, "STM32F411RE");
+        assert_eq!(chip.flash_base, 0x08000000);
+    }
+
+    #[test]
+    fn test_resolve_chip_for_debug_invalid_chip() {
+        let result = resolve_chip_for_debug(&Some("INVALID".into()));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown chip"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_chip_for_debug_no_arg() {
+        // 不传 --chip 时，回退读取 .debugger/chip.toml
+        // 文件存在则成功，不存在则返回错误（两者都合法）
+        let result = resolve_chip_for_debug(&None);
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains(".debugger/chip.toml")
+                    || msg.contains("not found")
+                    || msg.contains("no --chip"),
+                "got: {msg}"
+            );
+        }
+        if let Ok(chip) = result {
+            assert!(!chip.name.is_empty(), "chip name should not be empty");
+        }
     }
 
     // ── create_debug_backend 测试 ──

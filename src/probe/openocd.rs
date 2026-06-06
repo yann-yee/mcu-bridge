@@ -329,6 +329,16 @@ impl DebugProbe for OpenOcdBackend {
         Ok(())
     }
 
+    fn reset(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+        let response = self.tcl_command("reset run")?;
+        let response_lower = response.to_lowercase();
+        if response_lower.contains("error") || response_lower.contains("failed") {
+            anyhow::bail!("OpenOCD reset failed: {response}");
+        }
+        self.target_halted = false;
+        Ok(())
+    }
+
     fn step(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
         let response = self.tcl_command("step")?;
         let response_lower = response.to_lowercase();

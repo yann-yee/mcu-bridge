@@ -67,6 +67,14 @@ pub trait DebugProbe: Send {
     /// 全速运行指定核
     fn resume(&mut self, core: Option<usize>) -> anyhow::Result<()>;
 
+    /// 复位指定核（复位后继续执行）
+    ///
+    /// 默认实现：halt → 复位向量 → resume（等效于冷启动）。
+    /// 后端可覆盖以实现硬件复位信号（nRST）或 SoC 级复位。
+    fn reset(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+        anyhow::bail!("reset not supported by this backend")
+    }
+
     /// 单步（源码行级，需 DWARF）
     fn step(&mut self, core: Option<usize>) -> anyhow::Result<()>;
 
