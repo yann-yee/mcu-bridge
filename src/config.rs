@@ -4,6 +4,11 @@
 /// 可直接通过 `toml::from_str` 从 `.debugger/chip.toml` 反序列化。
 use serde::{Deserialize, Serialize};
 
+/// Default backend order used by auto backend selection.
+pub fn default_backend_order() -> Vec<String> {
+    vec!["probe-rs".into(), "openocd".into()]
+}
+
 /// 芯片配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChipConfig {
@@ -50,6 +55,9 @@ pub struct DebuggerConfig {
     pub speed_khz: u32,
     /// 后端: "probe-rs" | "openocd"
     pub backend: String,
+    /// 当 backend = "auto" 时使用的回退顺序
+    #[serde(default = "default_backend_order")]
+    pub backend_order: Vec<String>,
 }
 
 /// 串口/日志通道配置

@@ -1,22 +1,10 @@
-//! mcu-bridge — 面向 AI Agent 的嵌入式调试中间件。
-//!
-//! 入口点：解析 CLI 子命令，分发到对应处理函数。
-
-mod buffer;
-mod cli;
-mod config;
-mod dwarf;
-mod error;
-mod log;
-mod probe;
-mod session;
+//! Binary entry point for `mcu-bridge`.
 
 use clap::Parser;
 
-use crate::cli::{Cli, Commands};
+use mcu_bridge::cli::{self, Cli, Commands};
 
 fn main() -> anyhow::Result<()> {
-    // 初始化日志（默认 WARN 级别，可通过 RUST_LOG 环境变量覆盖）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp_millis()
         .init();
@@ -37,19 +25,21 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Flash {
             elf,
-            verify,
+            no_verify,
             chip,
             run,
             backend,
             openocd_cfg,
+            json,
         } => {
             cli::flash::handle(&cli::flash::FlashArgs {
                 elf,
-                verify,
+                no_verify,
                 chip,
                 run,
                 backend,
                 openocd_cfg,
+                json,
             })?;
         }
         Commands::Clean { all, older_than } => {
@@ -60,7 +50,7 @@ fn main() -> anyhow::Result<()> {
             config,
             json,
             no_flash,
-            verify,
+            no_verify,
             backend,
             enable_flash_bp,
             break_at,
@@ -78,7 +68,7 @@ fn main() -> anyhow::Result<()> {
                 config,
                 json,
                 no_flash,
-                verify,
+                no_verify,
                 backend,
                 enable_flash_bp,
                 break_at,
@@ -88,6 +78,19 @@ fn main() -> anyhow::Result<()> {
                 sampling_interval,
                 serial_port,
                 openocd_cfg,
+            })?;
+        }
+        Commands::Doctor {
+            chip,
+            backend,
+            openocd_cfg,
+            json,
+        } => {
+            cli::doctor::handle(&cli::doctor::DoctorArgs {
+                chip,
+                backend,
+                openocd_cfg,
+                json,
             })?;
         }
     }

@@ -8,26 +8,27 @@
 //!
 //! ⚠ 部分 CLI 参数是 P2/P3 预留（config/verify/enable_flash_bp）。
 
-#![allow(dead_code)]
-
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use crate::backend::{
+    create_backend_instance, load_app_config, load_optional_default_app_config,
+    resolve_backend_mode, resolve_backend_order, resolve_openocd_cfg,
+};
 use crate::buffer::serial::SerialMonitor;
 use crate::buffer::{DebugBuffer, LogBuffer, Sampler};
 use crate::cli::init;
 use crate::cli::json_session::JsonSession;
-use crate::config::{ChipConfig, FlashOpts};
+use crate::config::{AppConfig, ChipConfig, FlashOpts, FlashSection};
 use crate::dwarf::DwarfResolver;
 use crate::log::detect_log_backend;
+use crate::operations::capture_target_snapshot;
 use crate::probe::DebugProbe;
-use crate::probe::openocd::OpenOcdBackend;
-use crate::probe::probe_rs::ProbeRsBackend;
 use crate::session::{Session, SessionState};
 
 /// debug 子命令参数
@@ -37,7 +38,7 @@ pub struct DebugArgs {
     pub config: Option<PathBuf>,
     pub json: bool,
     pub no_flash: bool,
-    pub verify: bool,
+    pub no_verify: bool,
     pub backend: Option<String>,
     pub enable_flash_bp: bool,
     pub break_at: Vec<String>,
@@ -327,6 +328,12 @@ fn parse_u32(s: &str) -> Result<u32, std::num::ParseIntError> {
     } else {
         s.parse::<u32>()
     }
+}
+
+fn format_optional_hex(value: Option<u32>) -> String {
+    value
+        .map(|value| format!("0x{value:08x}"))
+        .unwrap_or_else(|| "?".into())
 }
 
 /// 解析 watch 规格，支持地址格式和 DWARF 变量名格式。
@@ -854,19 +861,39 @@ impl DebugRepl {
 
     /// 显示会话状态
     fn cmd_status(&self) {
-        let pc_str = self
+        let snapshot = self
             .session
-            .pc
-            .map(|p| format!("0x{p:08x}"))
-            .unwrap_or_else(|| "?".into());
+            .backend
+            .lock()
+            .ok()
+            .map(|mut backend| capture_target_snapshot(&mut **backend));
+        let registers = snapshot.as_ref().map(|snapshot| &snapshot.registers);
+        let fault = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.fault_summary.as_ref());
+        let pc_str = format_optional_hex(registers.and_then(|registers| registers.pc));
+        let sp_str = format_optional_hex(registers.and_then(|registers| registers.sp));
+        let xpsr_str = format_optional_hex(registers.and_then(|registers| registers.xpsr));
         println!(
-            "state={:?}  chip={}  bp={}  pc={}  cores={}",
+            "state={:?}  chip={}  backend={}  bp={}  pc={}  sp={}  xpsr={}  cores={}",
             self.session.state,
             self.session.chip_name,
+            self.session.backend_name,
             self.session.bp_count,
             pc_str,
+            sp_str,
+            xpsr_str,
             self.session.core_count
         );
+        if let Some(fault) = fault {
+            println!(
+                "faults: hfsr={} cfsr={} mmfar={} bfar={}",
+                format_optional_hex(Some(fault.hfsr)),
+                format_optional_hex(Some(fault.cfsr)),
+                format_optional_hex(Some(fault.mmfar)),
+                format_optional_hex(Some(fault.bfar))
+            );
+        }
     }
 
     /// 显示帮助
@@ -893,78 +920,80 @@ impl DebugRepl {
 }
 
 /// 解析芯片配置（CLI 参数优先，否则尝试 .debugger/chip.toml）。
-fn resolve_chip_for_debug(chip_arg: &Option<String>) -> anyhow::Result<ChipConfig> {
-    match chip_arg {
-        Some(name) => {
-            let mut chip = init::get_chip_template(name)?;
-            chip.name = name.clone();
-            Ok(chip)
-        }
-        None => {
-            // 尝试读取 .debugger/chip.toml
-            let path = Path::new(".debugger/chip.toml");
-            if path.exists() {
-                let content = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
-                let app: crate::config::AppConfig = toml::from_str(&content)
-                    .map_err(|e| anyhow::anyhow!("config parse error: {e}"))?;
-                Ok(app.chip)
-            } else {
-                anyhow::bail!(
-                    "no --chip argument and no .debugger/chip.toml found. \
-                     Use --chip <NAME> or run 'mcu-bridge init --chip <NAME>' first."
-                )
-            }
-        }
+fn load_debug_config(config_arg: Option<&PathBuf>) -> anyhow::Result<Option<AppConfig>> {
+    match config_arg {
+        Some(path) => Ok(Some(load_app_config(path)?)),
+        None => Ok(load_optional_default_app_config()),
     }
+}
+
+fn resolve_chip_for_debug(
+    chip_arg: &Option<String>,
+    config: Option<&AppConfig>,
+) -> anyhow::Result<ChipConfig> {
+    if let Some(name) = chip_arg {
+        let mut chip = init::get_chip_template(name)?;
+        chip.name = name.clone();
+        return Ok(chip);
+    }
+
+    config
+        .map(|app| app.chip.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no --chip argument and no .debugger/chip.toml found. Use --chip <NAME> or run 'mcu-bridge init --chip <NAME>' first."
+            )
+        })
 }
 
 /// 解析芯片配置并构造 FlashOpts。
 fn resolve_chip_and_flash_opts(
     chip_arg: &Option<String>,
+    config: Option<&AppConfig>,
+    no_verify: bool,
 ) -> anyhow::Result<(ChipConfig, FlashOpts)> {
-    let chip = resolve_chip_for_debug(chip_arg)?;
-    let opts = FlashOpts {
-        base: chip.flash_base,
-        size: chip.flash_size,
-        sections: vec![crate::config::FlashSection {
-            name: "app".into(),
-            addr: chip.flash_base,
-            len: chip.flash_size,
-        }],
-        verify: true,
-    };
-    Ok((chip, opts))
+    let chip = resolve_chip_for_debug(chip_arg, config)?;
+    if chip_arg.is_some() {
+        return Ok((
+            chip.clone(),
+            FlashOpts {
+                base: chip.flash_base,
+                size: chip.flash_size,
+                sections: vec![FlashSection {
+                    name: "app".into(),
+                    addr: chip.flash_base,
+                    len: chip.flash_size,
+                }],
+                verify: !no_verify,
+            },
+        ));
+    }
+
+    let app = config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no --chip argument and no .debugger/chip.toml found. Use --chip <NAME> or run 'mcu-bridge init --chip <NAME>' first."
+        )
+    })?;
+
+    let mut flash = app.flash.clone();
+    flash.verify = !no_verify;
+    Ok((app.chip.clone(), flash))
 }
 
-/// 创建调试后端（根据 `--backend` CLI 参数）。
+/// 创建调试后端（根据 CLI / config 解析后的 backend 模式，auto 仅取首选后端）。
 fn create_debug_backend(
-    backend_arg: &Option<String>,
-    openocd_cfg: &Option<String>,
+    backend_arg: Option<&str>,
+    openocd_cfg: Option<&str>,
+    config: Option<&AppConfig>,
 ) -> anyhow::Result<Box<dyn DebugProbe>> {
-    let backend_type = backend_arg.as_deref().unwrap_or("probe-rs");
-    match backend_type.to_ascii_lowercase().as_str() {
-        "probe-rs" => Ok(Box::new(ProbeRsBackend::new())),
-        "openocd" => {
-            // 优先级: --openocd-cfg CLI > .debugger/openocd.cfg 兜底
-            let cfg_path = openocd_cfg.clone().or_else(|| {
-                let default_path = Path::new(".debugger/openocd.cfg");
-                if default_path.exists() {
-                    Some(default_path.to_string_lossy().to_string())
-                } else {
-                    None
-                }
-            });
-            match cfg_path {
-                Some(path) => Ok(Box::new(OpenOcdBackend::new(Some(path)))),
-                None => anyhow::bail!(
-                    "OpenOCD backend requires a config file. \
-                     Use --openocd-cfg <PATH> or create .debugger/openocd.cfg"
-                ),
-            }
-        }
-        _ => anyhow::bail!("unknown backend '{backend_type}'. Supported: probe-rs, openocd"),
-    }
+    let backend_mode = resolve_backend_mode(backend_arg, config);
+    let backend_order = resolve_backend_order(&backend_mode, config)?;
+    let backend_name = backend_order
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("backend order cannot be empty"))?;
+    let openocd_cfg = resolve_openocd_cfg(openocd_cfg, config);
+    create_backend_instance(&backend_name, openocd_cfg)
 }
 
 /// 处理 debug 子命令
@@ -974,28 +1003,41 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
         anyhow::bail!("ELF file not found: {}", args.elf.display());
     }
 
+    let config = load_debug_config(args.config.as_ref())?;
+
     // 解析芯片配置 + 烧录参数
-    let (chip, flash_opts) = resolve_chip_and_flash_opts(&args.chip)?;
+    let (chip, flash_opts) =
+        resolve_chip_and_flash_opts(&args.chip, config.as_ref(), args.no_verify)?;
 
     // 创建后端
-    let backend = create_debug_backend(&args.backend, &args.openocd_cfg)?;
+    let backend = create_debug_backend(
+        args.backend.as_deref(),
+        args.openocd_cfg.as_deref(),
+        config.as_ref(),
+    )?;
 
     // 连接并创建会话
     let mut session = Session::attach(&chip, backend)?;
-    println!(
-        "[OK] attached to {}, {} core(s)",
-        chip.name, session.core_count
-    );
+    if !args.json {
+        println!(
+            "[OK] attached to {}, {} core(s) via {}",
+            chip.name, session.core_count, session.backend_name
+        );
+    }
 
     // 烧录固件（除非 --no-flash）
     if !args.no_flash {
-        println!("[INFO] flashing ELF...");
+        if !args.json {
+            println!("[INFO] flashing ELF...");
+        }
         session
             .backend
             .lock()
             .unwrap()
             .flash(&args.elf, &flash_opts)?;
-        println!("[OK] flash complete");
+        if !args.json {
+            println!("[OK] flash complete");
+        }
     }
 
     // 设置启动断点（--break-at）
@@ -1007,14 +1049,18 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
             .lock()
             .expect("backend lock")
             .set_breakpoint(addr, None)?;
-        println!("[#{}] breakpoint at 0x{addr:08x}", id);
+        if !args.json {
+            println!("[#{}] breakpoint at 0x{addr:08x}", id);
+        }
     }
 
     // halt-on-start 优先；仅当未指定 halt-on-start 且指定了 continue 时才 resume
     if !args.halt_on_start && args.continue_ {
         session.backend.lock().expect("backend lock").resume(None)?;
         session.state = SessionState::Running;
-        println!("[OK] target running");
+        if !args.json {
+            println!("[OK] target running");
+        }
     }
 
     // 采样与观测配置
@@ -1277,7 +1323,7 @@ mod tests {
             config: None,
             json: false,
             no_flash: false,
-            verify: true,
+            no_verify: false,
             backend: None,
             enable_flash_bp: false,
             break_at: vec![],
@@ -1306,7 +1352,7 @@ mod tests {
             config: None,
             json: false,
             no_flash: false,
-            verify: true,
+            no_verify: false,
             backend: None,
             enable_flash_bp: false,
             break_at: vec![],
@@ -1327,7 +1373,7 @@ mod tests {
 
     #[test]
     fn test_resolve_chip_for_debug_with_chip_arg() {
-        let result = resolve_chip_for_debug(&Some("STM32F411RE".into()));
+        let result = resolve_chip_for_debug(&Some("STM32F411RE".into()), None);
         assert!(
             result.is_ok(),
             "resolve_chip_for_debug with valid chip should succeed"
@@ -1339,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_resolve_chip_for_debug_invalid_chip() {
-        let result = resolve_chip_for_debug(&Some("INVALID".into()));
+        let result = resolve_chip_for_debug(&Some("INVALID".into()), None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown chip"), "got: {msg}");
@@ -1349,7 +1395,7 @@ mod tests {
     fn test_resolve_chip_for_debug_no_arg() {
         // 不传 --chip 时，回退读取 .debugger/chip.toml
         // 文件存在则成功，不存在则返回错误（两者都合法）
-        let result = resolve_chip_for_debug(&None);
+        let result = resolve_chip_for_debug(&None, load_optional_default_app_config().as_ref());
         if let Err(e) = &result {
             let msg = e.to_string();
             assert!(
@@ -1368,12 +1414,12 @@ mod tests {
 
     #[test]
     fn test_create_backend_probe_rs_default() {
-        assert!(create_debug_backend(&None, &None).is_ok());
+        assert!(create_debug_backend(None, None, None).is_ok());
     }
 
     #[test]
     fn test_create_backend_unknown() {
-        let result = create_debug_backend(&Some("invalid".into()), &None);
+        let result = create_debug_backend(Some("invalid"), None, None);
         assert!(result.is_err());
         // 验证错误信息 (通过 to_string 获取)
         let err_msg = match result {

@@ -80,6 +80,10 @@ impl Default for ProbeRsBackend {
 }
 
 impl DebugProbe for ProbeRsBackend {
+    fn backend_name(&self) -> &'static str {
+        "probe-rs"
+    }
+
     fn attach(&mut self, chip: &ChipConfig) -> anyhow::Result<()> {
         let target = probe_rs::config::TargetSelector::Unspecified(chip.name.clone());
         let config = probe_rs::SessionConfig {
@@ -160,15 +164,18 @@ impl DebugProbe for ProbeRsBackend {
         Ok(())
     }
 
-    fn flash(&mut self, elf: &Path, _opts: &FlashOpts) -> anyhow::Result<()> {
+    fn flash(&mut self, elf: &Path, opts: &FlashOpts) -> anyhow::Result<()> {
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("not attached"))?;
-        probe_rs::flashing::download_file(
+        let mut download_options = probe_rs::flashing::DownloadOptions::default();
+        download_options.verify = opts.verify;
+        probe_rs::flashing::download_file_with_options(
             session,
             elf,
             probe_rs::flashing::Format::Elf(probe_rs::flashing::ElfOptions::default()),
+            download_options,
         )
         .map_err(|e| anyhow::anyhow!("flash failed: {e}"))?;
         Ok(())

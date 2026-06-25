@@ -38,6 +38,9 @@ pub enum WatchKind {
 /// ⚠ 部分方法是 P2/P3 预留，当前未从 trait 调用路径触发 dead_code 警告。
 #[allow(dead_code)]
 pub trait DebugProbe: Send {
+    /// Stable backend identifier used in protocol events and reports.
+    fn backend_name(&self) -> &'static str;
+
     // ── 会话生命周期 ──
 
     /// 连接到目标芯片

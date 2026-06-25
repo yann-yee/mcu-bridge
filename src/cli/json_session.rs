@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::buffer::serial::LogEvent;
 use crate::buffer::{DebugBuffer, LogBuffer, LogEntry, Sampler};
 use crate::cli::debug::Command;
+use crate::operations::capture_target_snapshot;
 use crate::session::{Session, SessionState};
 
 // ── JSON-Lines 协议类型 ──
@@ -60,6 +61,12 @@ pub struct JsonResponse {
 pub struct JsonEvent {
     pub event: String,
     pub data: Value,
+}
+
+#[derive(Debug)]
+struct JsonExecError {
+    code: &'static str,
+    message: String,
 }
 
 // ── Schema 命令元数据 ──
@@ -493,6 +500,16 @@ impl JsonSession {
     pub fn run(&mut self) -> anyhow::Result<()> {
         use std::io::{self, BufRead};
         let stdin = io::stdin();
+        let attached = JsonEvent {
+            event: "attached".into(),
+            data: json!({
+                "chip": self.session.chip_name.clone(),
+                "core_count": self.session.core_count,
+                "backend": self.session.backend_name.clone(),
+                "state": format!("{:?}", self.session.state),
+            }),
+        };
+        Self::send_json(&attached);
         for line in stdin.lock().lines() {
             let line = match line {
                 Ok(l) => l,
@@ -578,8 +595,7 @@ impl JsonSession {
         }
 
         // 执行
-        let result = self.execute_json(cmd);
-        match result {
+        match self.execute_json(cmd) {
             Ok(data) => {
                 let resp = JsonResponse {
                     id: req.id,
@@ -589,24 +605,15 @@ impl JsonSession {
                 };
                 Self::send_json(&resp);
             }
-            Err(e) => {
-                let resp = JsonResponse {
-                    id: req.id,
-                    status: "error".into(),
-                    data: None,
-                    error: Some(JsonError {
-                        code: "E_BACKEND".into(),
-                        message: e.to_string(),
-                    }),
-                };
-                Self::send_json(&resp);
+            Err(err) => {
+                Self::send_json(&Self::error_response(req.id, err.code, err.message));
             }
         }
         false
     }
 
     /// 执行命令并返回 JSON data
-    fn execute_json(&mut self, cmd: Command) -> anyhow::Result<Option<Value>> {
+    fn execute_json(&mut self, cmd: Command) -> Result<Option<Value>, JsonExecError> {
         match cmd {
             Command::Halt => {
                 self.stop_sampler();
@@ -614,21 +621,24 @@ impl JsonSession {
                     .backend
                     .lock()
                     .expect("backend lock")
-                    .halt(None)?;
+                    .halt(None)
+                    .map_err(Self::backend_failure)?;
                 self.session.state = SessionState::Halted;
                 Ok(Some(json!({"status": "halted"})))
             }
             Command::Resume => {
                 if self.sampler_thread.is_some() {
-                    return Ok(Some(
-                        json!({"status": "error", "error": "sampler already running, halt first"}),
-                    ));
+                    return Err(JsonExecError {
+                        code: "E_STATE",
+                        message: "sampler already running, halt first".into(),
+                    });
                 }
                 self.session
                     .backend
                     .lock()
                     .expect("backend lock")
-                    .resume(None)?;
+                    .resume(None)
+                    .map_err(Self::backend_failure)?;
                 self.session.state = SessionState::Running;
                 // 如果有 watch target，启动采样线程
                 let watch_count = self.buffer.read().unwrap().targets.len();
@@ -651,7 +661,8 @@ impl JsonSession {
                     .backend
                     .lock()
                     .expect("backend lock")
-                    .step(None)?;
+                    .step(None)
+                    .map_err(Self::backend_failure)?;
                 let pc = self
                     .session
                     .backend
@@ -679,7 +690,8 @@ impl JsonSession {
                     .backend
                     .lock()
                     .unwrap()
-                    .set_breakpoint(addr, None)?;
+                    .set_breakpoint(addr, None)
+                    .map_err(Self::backend_failure)?;
                 self.session.bp_count += 1;
                 Ok(Some(json!({"bp_id": id, "addr": addr})))
             }
@@ -689,7 +701,8 @@ impl JsonSession {
                     .backend
                     .lock()
                     .expect("backend lock")
-                    .read_regs(None)?;
+                    .read_regs(None)
+                    .map_err(Self::backend_failure)?;
                 let mut map = serde_json::Map::new();
                 for (k, v) in &regs {
                     map.insert(k.clone(), json!(v));
@@ -702,21 +715,38 @@ impl JsonSession {
                     .backend
                     .lock()
                     .unwrap()
-                    .read_mem(addr, len, None)?;
+                    .read_mem(addr, len, None)
+                    .map_err(Self::backend_failure)?;
                 Ok(Some(json!({"addr": addr, "len": len, "data": data})))
             }
             Command::Status => {
-                let pc_str = self
+                let snapshot = self
                     .session
-                    .pc
-                    .map(|p| format!("0x{p:08x}"))
-                    .unwrap_or_else(|| "?".into());
+                    .backend
+                    .lock()
+                    .ok()
+                    .map(|mut backend| capture_target_snapshot(&mut **backend));
+                let registers = snapshot.as_ref().map(|snapshot| &snapshot.registers);
+                let fault_summary = snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.fault_summary.as_ref());
                 Ok(Some(json!({
                     "state": format!("{:?}", self.session.state),
-                    "chip": self.session.chip_name,
+                    "chip": self.session.chip_name.clone(),
+                    "backend": self.session.backend_name.clone(),
                     "bp_count": self.session.bp_count,
-                    "pc": pc_str,
+                    "watch_count": self.session.watch_count,
                     "core_count": self.session.core_count,
+                    "halted": snapshot.as_ref().map(|snapshot| snapshot.halted),
+                    "pc": registers.and_then(|registers| registers.pc),
+                    "sp": registers.and_then(|registers| registers.sp),
+                    "xpsr": registers.and_then(|registers| registers.xpsr),
+                    "fault_summary": fault_summary.map(|fault| json!({
+                        "hfsr": fault.hfsr,
+                        "cfsr": fault.cfsr,
+                        "mmfar": fault.mmfar,
+                        "bfar": fault.bfar,
+                    })),
                 })))
             }
             Command::Help => {
@@ -770,16 +800,16 @@ impl JsonSession {
                 let dwarf = match self.dwarf.as_ref() {
                     Some(d) => d,
                     None => {
-                        return Ok(Some(
-                            json!({"status": "error", "error": "no DWARF info available"}),
-                        ));
+                        return Err(JsonExecError {
+                            code: "E_NO_DWARF",
+                            message: "no DWARF info available".into(),
+                        });
                     }
                 };
                 match subcmd {
                     InfoSubcmd::Functions => {
                         let funcs = dwarf.list_functions();
                         Ok(Some(json!({
-                            "status": "ok",
                             "subcmd": "functions",
                             "count": funcs.len(),
                             "functions": funcs.iter().map(|f| json!({
@@ -793,7 +823,6 @@ impl JsonSession {
                     InfoSubcmd::Variables => {
                         let vars = dwarf.list_variables();
                         Ok(Some(json!({
-                            "status": "ok",
                             "subcmd": "variables",
                             "count": vars.len(),
                             "variables": vars.iter().map(|v| json!({
@@ -808,7 +837,6 @@ impl JsonSession {
                         // 查询函数
                         if let Some(addr) = dwarf.function_addr(&name) {
                             return Ok(Some(json!({
-                                "status": "ok",
                                 "kind": "function",
                                 "name": name,
                                 "addr": addr,
@@ -817,17 +845,16 @@ impl JsonSession {
                         // 查询变量
                         if let Some(var) = dwarf.variable_info(&name) {
                             return Ok(Some(json!({
-                                "status": "ok",
                                 "kind": "variable",
                                 "name": var.name,
                                 "addr": var.addr,
                                 "size": var.size,
                             })));
                         }
-                        Ok(Some(json!({
-                            "status": "error",
-                            "error": format!("symbol '{}' not found in DWARF", name),
-                        })))
+                        Err(JsonExecError {
+                            code: "E_PARAM",
+                            message: format!("symbol '{}' not found in DWARF", name),
+                        })
                     }
                 }
             }
@@ -867,20 +894,13 @@ impl JsonSession {
         self.session.state = SessionState::Halted;
         drop(guard); // 释放锁，允许 stop_sampler 获取
         self.stop_sampler();
-        // 重新锁 backend 读取 PC
-        let pc = self
+        let snapshot = self
             .session
             .backend
             .lock()
-            .unwrap()
-            .read_regs(None)
             .ok()
-            .and_then(|regs| {
-                regs.get("pc")
-                    .or_else(|| regs.get("PC"))
-                    .copied()
-                    .map(|v| v as u32)
-            });
+            .map(|mut backend| capture_target_snapshot(&mut **backend));
+        let pc = snapshot.as_ref().and_then(|snapshot| snapshot.registers.pc);
         // 通过 DWARF 查询 PC 对应的函数名
         let function_name = pc.and_then(|pc_val| {
             self.dwarf
@@ -893,6 +913,17 @@ impl JsonSession {
                 "pc": pc.unwrap_or(0),
                 "core": active_core,
                 "function": function_name,
+                "sp": snapshot.as_ref().and_then(|snapshot| snapshot.registers.sp),
+                "xpsr": snapshot.as_ref().and_then(|snapshot| snapshot.registers.xpsr),
+                "fault_summary": snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.fault_summary.as_ref())
+                    .map(|fault| json!({
+                        "hfsr": fault.hfsr,
+                        "cfsr": fault.cfsr,
+                        "mmfar": fault.mmfar,
+                        "bfar": fault.bfar,
+                    })),
             }),
         };
         Self::send_json(&event);
@@ -927,6 +958,25 @@ impl JsonSession {
         }
     }
 
+    fn backend_failure(err: anyhow::Error) -> JsonExecError {
+        JsonExecError {
+            code: "E_BACKEND",
+            message: err.to_string(),
+        }
+    }
+
+    fn error_response(id: u64, code: &str, message: String) -> JsonResponse {
+        JsonResponse {
+            id,
+            status: "error".into(),
+            data: None,
+            error: Some(JsonError {
+                code: code.into(),
+                message,
+            }),
+        }
+    }
+
     // ── I/O 辅助方法 ──
 
     /// 向 stdout 写入一行 JSON
@@ -939,16 +989,7 @@ impl JsonSession {
 
     /// 快速发送错误响应
     fn send_error(id: u64, code: &str, message: &str) {
-        let resp = JsonResponse {
-            id,
-            status: "error".into(),
-            data: None,
-            error: Some(JsonError {
-                code: code.into(),
-                message: message.into(),
-            }),
-        };
-        Self::send_json(&resp);
+        Self::send_json(&Self::error_response(id, code, message.into()));
     }
 }
 
@@ -1066,10 +1107,22 @@ mod tests {
     // ── Schema 测试 ──
 
     #[test]
-    fn test_schema_has_all_commands() {
+    fn schema_consistency() {
         let schema = generate_schema();
         // 14 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer, serial, info
         assert_eq!(schema.commands.len(), 14);
+        assert!(
+            schema
+                .commands
+                .iter()
+                .any(|command| command.name == "resume")
+        );
+        assert!(
+            !schema
+                .commands
+                .iter()
+                .any(|command| command.name == "continue")
+        );
     }
 
     #[test]
@@ -1094,5 +1147,16 @@ mod tests {
         let json_str = serde_json::to_string(&event).unwrap();
         assert!(json_str.contains("\"event\":\"halted\""));
         assert!(json_str.contains("\"pc\":"));
+    }
+
+    #[test]
+    fn test_event_attached_format() {
+        let event = JsonEvent {
+            event: "attached".into(),
+            data: json!({"chip": "STM32F411RE", "core_count": 1, "backend": "probe-rs"}),
+        };
+        let json_str = serde_json::to_string(&event).unwrap();
+        assert!(json_str.contains("\"event\":\"attached\""));
+        assert!(json_str.contains("\"backend\":\"probe-rs\""));
     }
 }

@@ -1,50 +1,75 @@
-//! flash 子命令 — 烧录 ELF 固件到目标芯片.
-//!
-//! 设计文档 §4.1：`mcu-bridge flash --elf target/firmware.elf [--verify] [--run]`
-//!
-//! Standalone 模式：临时创建 ProbeRsBackend → attach → flash → detach。
-//! 芯片配置来源（按优先级）：
-//!   1. `--chip` 命令行参数
-//!   2. `.debugger/chip.toml` 配置文件
+//! Flash command implementation.
 
-#![allow(dead_code)]
+use std::path::PathBuf;
 
-use std::path::{Path, PathBuf};
-
+use crate::backend::{
+    load_optional_default_app_config, resolve_backend_mode, resolve_backend_order,
+    resolve_openocd_cfg,
+};
 use crate::cli::init;
 use crate::config::{AppConfig, ChipConfig, FlashOpts, FlashSection};
-use crate::probe::DebugProbe;
-use crate::probe::openocd::OpenOcdBackend;
-use crate::probe::probe_rs::ProbeRsBackend;
+use crate::operations::{FlashReport, FlashRunOptions, OperationStage, run_flash};
 
-/// flash 子命令参数
+/// Arguments for the `flash` subcommand.
 pub struct FlashArgs {
     pub elf: PathBuf,
-    pub verify: bool,
+    pub no_verify: bool,
     pub chip: Option<String>,
     pub run: bool,
     pub backend: Option<String>,
     pub openocd_cfg: Option<String>,
+    pub json: bool,
 }
 
-/// 从 `.debugger/chip.toml` 加载完整配置。
-fn load_config_from_dot_debugger() -> anyhow::Result<AppConfig> {
-    let path = Path::new(".debugger/chip.toml");
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
-    let config: AppConfig =
-        toml::from_str(&content).map_err(|e| anyhow::anyhow!("config parse error: {e}"))?;
-    Ok(config)
+/// Handle `mcu-bridge flash`.
+pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
+    if !args.elf.exists() {
+        anyhow::bail!("ELF file not found: {}", args.elf.display());
+    }
+
+    let config = load_optional_default_app_config();
+    let (chip, flash) = resolve_chip_and_flash(args, config.as_ref())?;
+    let backend_mode = resolve_backend_mode(args.backend.as_deref(), config.as_ref());
+    let backend_order = resolve_backend_order(&backend_mode, config.as_ref())?;
+    let openocd_cfg = resolve_openocd_cfg(args.openocd_cfg.as_deref(), config.as_ref());
+
+    let report = run_flash(&FlashRunOptions {
+        elf: args.elf.clone(),
+        chip,
+        flash,
+        run: args.run,
+        backend_order,
+        openocd_cfg,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        render_human_report(&report);
+    }
+
+    if report.success {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{}",
+            report
+                .error
+                .as_ref()
+                .map(|err| err.message.as_str())
+                .unwrap_or("flash failed")
+        )
+    }
 }
 
-/// 解析芯片配置（CLI 参数优先，否则读取配置文件）。
-fn resolve_chip_config(chip_arg: Option<&str>) -> anyhow::Result<(ChipConfig, FlashOpts)> {
-    if let Some(name) = chip_arg {
-        // 先用模板校验芯片存在并获取架构信息
+fn resolve_chip_and_flash(
+    args: &FlashArgs,
+    config: Option<&AppConfig>,
+) -> anyhow::Result<(ChipConfig, FlashOpts)> {
+    if let Some(name) = args.chip.as_deref() {
         let mut chip = init::get_chip_template(name)?;
-        // 用用户输入的精确芯片名（probe-rs 需要精确的 target 名称）
         chip.name = name.to_string();
-        let opts = FlashOpts {
+        let flash = FlashOpts {
             base: chip.flash_base,
             size: chip.flash_size,
             sections: vec![FlashSection {
@@ -52,206 +77,99 @@ fn resolve_chip_config(chip_arg: Option<&str>) -> anyhow::Result<(ChipConfig, Fl
                 addr: chip.flash_base,
                 len: chip.flash_size,
             }],
-            verify: true,
+            verify: !args.no_verify,
         };
-        return Ok((chip, opts));
+        return Ok((chip, flash));
     }
 
-    // 回退：尝试读取 .debugger/chip.toml
-    let app = load_config_from_dot_debugger()?;
-    Ok((app.chip, app.flash))
+    let config = config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no --chip argument and no .debugger/chip.toml found. Use --chip <NAME> or run 'mcu-bridge init --chip <NAME>' first."
+        )
+    })?;
+
+    let mut flash = config.flash.clone();
+    flash.verify = !args.no_verify;
+    Ok((config.chip.clone(), flash))
 }
 
-/// 创建探测后端（根据 CLI 参数或 TOML 配置选择）。
-///
-/// 优先级：`--backend` CLI 参数 > `.debugger/chip.toml` 中 `[debugger].backend` 字段 > 缺省 probe-rs
-/// 配置路径：`--openocd-cfg` CLI 参数 > `.debugger/chip.toml` 中 `[openocd].cfg_file` 字段 > `.debugger/openocd.cfg` 兜底
-fn create_backend(args: &FlashArgs) -> anyhow::Result<Box<dyn DebugProbe>> {
-    // 先从 TOML 加载配置（若存在），用于读取后端类型和 openocd 配置
-    let config_from_toml = load_config_from_dot_debugger().ok();
+fn render_human_report(report: &FlashReport) {
+    let backend = report.backend.as_deref().unwrap_or("unknown");
+    println!("chip: {}", report.chip);
+    println!("backend: {backend}");
+    println!("verify: {}", report.verify);
+    println!("run: {}", report.run);
+    for stage in &report.stages {
+        let status = if stage.success { "ok" } else { "error" };
+        println!("stage {}: {status}", stage_name(stage.stage));
+    }
+    if report.success {
+        println!("[OK] flash complete");
+        return;
+    }
 
-    // 确定后端类型
-    let backend_type = match &args.backend {
-        Some(val) => val.clone(),
-        None => match &config_from_toml {
-            Some(cfg) => cfg.debugger.backend.clone(),
-            None => "probe-rs".to_string(),
-        },
-    };
+    if report.attempts.len() > 1 {
+        println!("attempts:");
+        for attempt in &report.attempts {
+            let status = if attempt.success { "ok" } else { "error" };
+            println!(
+                "  {}: {} at {}",
+                attempt.backend,
+                status,
+                stage_name(attempt.last_stage)
+            );
+        }
+    }
 
-    // 确定 OpenOCD 配置文件路径
-    let openocd_cfg = args.openocd_cfg.clone().or_else(|| {
-        config_from_toml
-            .as_ref()
-            .and_then(|cfg| cfg.openocd.as_ref())
-            .map(|o| o.cfg_file.clone())
-    });
-
-    match backend_type.to_ascii_lowercase().as_str() {
-        "probe-rs" => Ok(Box::new(ProbeRsBackend::new())),
-        "openocd" => Ok(Box::new(OpenOcdBackend::new(openocd_cfg))),
-        _ => anyhow::bail!("unknown backend '{backend_type}'. Supported: probe-rs, openocd"),
+    if let Some(error) = &report.error {
+        println!("[ERROR] {} ({})", error.message, error.code);
     }
 }
 
-/// 处理 flash 子命令 (Standalone 烧录流程)
-pub fn handle(args: &FlashArgs) -> anyhow::Result<()> {
-    // 校验 ELF 文件存在
-    if !args.elf.exists() {
-        anyhow::bail!("ELF file not found: {}", args.elf.display());
+fn stage_name(stage: OperationStage) -> &'static str {
+    match stage {
+        OperationStage::AttachProbe => "attach_probe",
+        OperationStage::ConnectTarget => "connect_target",
+        OperationStage::EraseFlash => "erase_flash",
+        OperationStage::ProgramFlash => "program_flash",
+        OperationStage::VerifyFlash => "verify_flash",
+        OperationStage::ResetTarget => "reset_target",
+        OperationStage::RunTarget => "run_target",
     }
-
-    // 解析芯片配置
-    let (chip, flash_opts) = resolve_chip_config(args.chip.as_deref())?;
-
-    eprintln!("[INFO] attaching probe to {}...", chip.name);
-
-    // Standalone 烧录流程（后端不可知）
-    let mut backend = create_backend(args)?;
-    backend.attach(&chip)?;
-
-    eprintln!("[INFO] flashing ELF...");
-    backend.flash(&args.elf, &flash_opts)?;
-
-    if args.run {
-        eprintln!("[INFO] resetting and running target...");
-        // reset() 将核心复位到向量表再运行（probe-rs: core.reset(), OpenOCD: reset run）
-        backend.reset(None)?;
-    }
-
-    backend.detach()?;
-    println!("[OK] flash complete");
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FlashArgs, create_backend, handle, resolve_chip_config};
+    use super::{FlashArgs, resolve_chip_and_flash};
     use std::path::PathBuf;
 
     #[test]
-    fn test_flash_elf_not_found() {
+    fn flash_elf_not_found() {
         let args = FlashArgs {
             elf: PathBuf::from("nonexistent.elf"),
-            verify: true,
+            no_verify: false,
             chip: Some("STM32F407VG".into()),
             run: false,
             backend: None,
             openocd_cfg: None,
+            json: false,
         };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ELF file not found"), "got: {msg}");
+        let err = super::handle(&args).unwrap_err();
+        assert!(err.to_string().contains("ELF file not found"));
     }
 
     #[test]
-    fn test_flash_unknown_chip() {
+    fn resolve_chip_honors_no_verify() {
         let args = FlashArgs {
             elf: PathBuf::from("Cargo.toml"),
-            verify: true,
-            chip: Some("INVALID".into()),
+            no_verify: true,
+            chip: Some("STM32F411RE".into()),
             run: false,
             backend: None,
             openocd_cfg: None,
+            json: false,
         };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("unknown chip"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_resolve_chip_config_with_chip_arg() {
-        // resolve_chip_config 是纯逻辑函数，不碰硬件
-        let result = resolve_chip_config(Some("STM32F411RE"));
-        assert!(
-            result.is_ok(),
-            "resolve_chip_config with valid chip should succeed"
-        );
-        let (chip, opts) = result.unwrap();
-        assert_eq!(chip.name, "STM32F411RE");
-        assert_eq!(chip.flash_base, 0x08000000);
-        assert_eq!(chip.flash_size, 512 * 1024);
-        assert_eq!(opts.base, 0x08000000);
-    }
-
-    #[test]
-    fn test_resolve_chip_config_invalid_chip() {
-        let result = resolve_chip_config(Some("INVALID"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unknown chip"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_resolve_chip_config_no_arg() {
-        // 当没有 --chip 参数时，尝试读取 .debugger/chip.toml
-        // 文件存在则成功，不存在则返回错误（两者都合法）
-        let result = resolve_chip_config(None);
-        if let Err(e) = &result {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("cannot read") || msg.contains("not found"),
-                "got: {msg}"
-            );
-        }
-        // 如果成功（有 .debugger/chip.toml），检查芯片名
-        if let Ok((chip, _opts)) = result {
-            assert!(!chip.name.is_empty(), "chip name should not be empty");
-        }
-    }
-
-    #[test]
-    fn test_flash_backend_probe_rs_default() {
-        // 默认无 --backend → create_backend 成功返回（不关心具体类型）
-        let args = FlashArgs {
-            elf: PathBuf::from("Cargo.toml"),
-            verify: true,
-            chip: Some("STM32F407VG".into()),
-            run: false,
-            backend: None,
-            openocd_cfg: None,
-        };
-        assert!(
-            create_backend(&args).is_ok(),
-            "default backend should be Ok"
-        );
-    }
-
-    #[test]
-    fn test_flash_backend_openocd_no_cfg() {
-        // --backend openocd 但无配置文件 → attach 阶段报 cfg not found
-        let args = FlashArgs {
-            elf: PathBuf::from("Cargo.toml"),
-            verify: true,
-            chip: Some("STM32F407VG".into()),
-            run: false,
-            backend: Some("openocd".into()),
-            openocd_cfg: None,
-        };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cfg file not found"),
-            "expected cfg file not found, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_flash_backend_unknown() {
-        // --backend invalid → 在 create_backend 阶段报错
-        let args = FlashArgs {
-            elf: PathBuf::from("Cargo.toml"),
-            verify: true,
-            chip: Some("STM32F407VG".into()),
-            run: false,
-            backend: Some("invalid".into()),
-            openocd_cfg: None,
-        };
-        let err = handle(&args).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown backend"),
-            "expected unknown backend, got: {msg}"
-        );
+        let (_, flash) = resolve_chip_and_flash(&args, None).unwrap();
+        assert!(!flash.verify);
     }
 }

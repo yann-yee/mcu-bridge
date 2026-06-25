@@ -67,6 +67,7 @@ CLI / Agent (JSON-Lines)
 | `flash` | 烧录 ELF 固件 | `mcu-bridge flash --elf fw.elf --run` |
 | `clean` | 清理缓存 | `mcu-bridge clean --all` |
 | `debug` | 启动调试会话 | `mcu-bridge debug --elf fw.elf` |
+| `doctor` | 非写入式连接/状态诊断 | `mcu-bridge doctor --json` |
 
 ### debug 子命令关键参数
 
@@ -75,8 +76,9 @@ CLI / Agent (JSON-Lines)
 | `--elf <PATH>` | ELF 文件路径（必需） |
 | `--json` | Agent JSON-Lines 模式（默认 Human REPL） |
 | `--no-flash` | 跳过烧录步骤 |
+| `--no-verify` | 关闭 Flash 回读校验（默认开启） |
 | `--chip <NAME>` | 芯片型号（默认从 `.debugger/chip.toml` 读取） |
-| `--backend <NAME>` | 强制指定后端：`probe-rs`（默认）\| `openocd` |
+| `--backend <NAME>` | 强制指定后端：`probe-rs` \| `openocd` \| `auto` |
 | `--openocd-cfg <PATH>` | OpenOCD 配置文件路径 |
 | `--break <ADDR>` | 启动后立即设断点（可重复） |
 | `--watch <ADDR>:<SIZE>` | 启动后立即设数据观测（可重复） |
@@ -111,8 +113,10 @@ Agent 通过 stdin/stdout 每行一个 JSON 对象与 `mcu-bridge` 通信：
 → {"cmd":"break","args":{"addr":134218240},"id":2}
 ← {"id":2,"status":"ok","data":{"id":0,"addr":134218240}}
 
-→ {"cmd":"continue","id":3}
-← {"id":3,"status":"ok","data":{"status":"running"}}
+← {"event":"attached","data":{"chip":"STM32F411RE","core_count":1,"backend":"probe-rs","state":"Halted"}}
+
+→ {"cmd":"resume","id":3}
+← {"id":3,"status":"ok","data":{"status":"running","sampling":false,"sampling_interval_ms":10}}
 
 ← {"event":"halted","data":{"pc":134218242,"core":0,"function":"main+0x02"}}
 
@@ -121,13 +125,13 @@ Agent 通过 stdin/stdout 每行一个 JSON 对象与 `mcu-bridge` 通信：
 ```
 
 Agent 标准调试闭环：
-1. `mcu-bridge debug --elf fw.elf --json` → 收到 `{"status":"attached",...}`
+1. `mcu-bridge debug --elf fw.elf --json` → 收到 `{"event":"attached",...}`
 2. `{"cmd":"schema"}` 获取协议自描述
-3. 设断点、watch target → `continue`
+3. 设断点、watch target → `resume`
 4. 采样线程持续写入 ring buffer
 5. 断点命中 → `{"event":"halted",...}` 含函数名
 6. `{"cmd":"buffer","since":N}` 增量分析历史数据
-7. 调整断点 → `continue` → 循环
+7. 调整断点 → `resume` → 循环
 
 ## 后端选择逻辑
 

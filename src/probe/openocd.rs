@@ -193,6 +193,10 @@ impl Drop for OpenOcdBackend {
 }
 
 impl DebugProbe for OpenOcdBackend {
+    fn backend_name(&self) -> &'static str {
+        "openocd"
+    }
+
     fn attach(&mut self, _chip: &ChipConfig) -> anyhow::Result<()> {
         // 解析配置文件路径
         let resolved_cfg = match &self.cfg_path {

@@ -27,6 +27,8 @@ pub struct Session {
     pub state: SessionState,
     /// 芯片名称
     pub chip_name: String,
+    /// Active backend identifier.
+    pub backend_name: String,
     /// 探针检测到的核数
     pub core_count: usize,
     /// 当前 PC 值 (halted 时有效)
@@ -45,12 +47,14 @@ impl Session {
     /// 调用方负责创建并传入 `backend`，可注入 mock 便于测试。
     pub fn attach(chip: &ChipConfig, backend: Box<dyn DebugProbe>) -> anyhow::Result<Self> {
         let mut backend = backend;
+        let backend_name = backend.backend_name().to_string();
         backend.attach(chip)?;
         let core_count = backend.core_count();
         info!("session attached to {} ({} core(s))", chip.name, core_count);
         Ok(Self {
             state: SessionState::Halted,
             chip_name: chip.name.clone(),
+            backend_name,
             core_count,
             pc: None,
             bp_count: 0,
@@ -81,6 +85,7 @@ impl Session {
         Self {
             state: SessionState::Halted,
             chip_name,
+            backend_name: "probe-rs".into(),
             core_count: 0,
             pc: None,
             bp_count: 0,
@@ -97,6 +102,7 @@ impl Default for Session {
         Self {
             state: SessionState::Halted,
             chip_name: "unknown".into(),
+            backend_name: "probe-rs".into(),
             core_count: 0,
             pc: None,
             bp_count: 0,

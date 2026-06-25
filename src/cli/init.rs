@@ -7,7 +7,7 @@ use std::fs;
 
 use crate::config::{
     AppConfig, ChipConfig, DebuggerConfig, FlashBpConfig, FlashOpts, FlashSection, RecoveryConfig,
-    SerialConfig, WatchConfig,
+    SerialConfig, WatchConfig, default_backend_order,
 };
 
 /// init 子命令参数
@@ -63,7 +63,8 @@ pub fn handle(args: &InitArgs) -> anyhow::Result<()> {
             probe: debugger_probe.clone(),
             interface: debugger_interface,
             speed_khz: 4000,
-            backend: "probe-rs".into(),
+            backend: "auto".into(),
+            backend_order: default_backend_order(),
         },
         flash: FlashOpts {
             base: chip.flash_base,
