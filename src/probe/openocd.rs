@@ -592,7 +592,10 @@ impl DebugProbe for OpenOcdBackend {
                 }
                 false
             }
-            Err(_) => false,
+            Err(_) => {
+                self.connected = false;
+                false
+            }
         }
     }
 }
@@ -610,6 +613,16 @@ mod tests {
         assert_eq!(backend.core_count(), 1);
         assert_eq!(backend.active_core(), 0);
         assert!(!backend.is_halted(None));
+    }
+
+    /// Poll transport errors clear a stale connected state without starting OpenOCD.
+    #[test]
+    fn test_poll_error_marks_backend_disconnected() {
+        let mut backend = OpenOcdBackend::new(None);
+        backend.connected = true;
+
+        assert!(!backend.poll_halted(None));
+        assert!(!backend.is_connected());
     }
 
     /// 配置文件不存在时返回 Err。

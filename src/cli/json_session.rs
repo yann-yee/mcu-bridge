@@ -94,7 +94,17 @@ pub struct ArgMeta {
 #[derive(Debug, Serialize)]
 pub struct SchemaData {
     pub commands: Vec<CommandMeta>,
+    pub events: Vec<EventMeta>,
     pub error_codes: HashMap<String, String>,
+}
+
+/// Metadata for an asynchronous JSON-Lines event.
+#[derive(Debug, Serialize)]
+pub struct EventMeta {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// 生成 schema 响应数据
@@ -293,11 +303,100 @@ fn generate_schema() -> SchemaData {
 
     SchemaData {
         commands,
+        events: vec![
+            EventMeta {
+                name: "attached".into(),
+                description: "Debug session attached".into(),
+                error_code: None,
+            },
+            EventMeta {
+                name: "halted".into(),
+                description: "Target stopped".into(),
+                error_code: None,
+            },
+            EventMeta {
+                name: "log".into(),
+                description: "New log data is available".into(),
+                error_code: None,
+            },
+            EventMeta {
+                name: "probe_recovering".into(),
+                description: "Probe disconnected; recovery is in progress".into(),
+                error_code: Some("E_PROBE".into()),
+            },
+            EventMeta {
+                name: "probe_recovered".into(),
+                description: "Probe recovered and target state was refreshed".into(),
+                error_code: None,
+            },
+            EventMeta {
+                name: "probe_lost".into(),
+                description: "Probe recovery failed; the session is ending".into(),
+                error_code: Some("E_PROBE_LOST".into()),
+            },
+        ],
         error_codes,
     }
 }
 
 // ── JSON → Command 映射 ──
+
+fn optional_u32(req: &JsonRequest, key: &str) -> Result<Option<u32>, JsonResponse> {
+    let Some(value) = req.args.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            JsonSession::error_response(
+                req.id,
+                "E_PARAM",
+                format!("invalid '{key}' (expected a u32 integer)"),
+            )
+        })
+}
+
+fn optional_u64(req: &JsonRequest, key: &str) -> Result<Option<u64>, JsonResponse> {
+    let Some(value) = req.args.get(key) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        JsonSession::error_response(
+            req.id,
+            "E_PARAM",
+            format!("invalid '{key}' (expected a non-negative integer)"),
+        )
+    })
+}
+
+fn optional_string(req: &JsonRequest, key: &str) -> Result<Option<String>, JsonResponse> {
+    let Some(value) = req.args.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(|value| value.to_string())
+        .map(Some)
+        .ok_or_else(|| {
+            JsonSession::error_response(
+                req.id,
+                "E_PARAM",
+                format!("invalid '{key}' (expected a string)"),
+            )
+        })
+}
+
+fn required_u32(req: &JsonRequest, key: &str) -> Result<u32, JsonResponse> {
+    optional_u32(req, key)?.ok_or_else(|| {
+        JsonSession::error_response(
+            req.id,
+            "E_PARAM",
+            format!("missing or invalid '{key}' (expected a u32 integer)"),
+        )
+    })
+}
 
 /// 将 JSON 请求映射为 Command。
 ///
@@ -323,46 +422,27 @@ pub fn json_to_command(
         "resume" => Ok(Command::Resume),
         "step" => Ok(Command::Step),
         "break" => {
-            let addr = if let Some(name) = req.args.get("name").and_then(|v| v.as_str()) {
+            let name = optional_string(req, "name")?;
+            let addr = optional_u32(req, "addr")?;
+            let addr = if let Some(name) = name {
                 // 名称优先
-                dwarf.and_then(|d| d.function_addr(name)).ok_or_else(|| {
+                dwarf.and_then(|d| d.function_addr(&name)).ok_or_else(|| {
                     err_response("E_PARAM", format!("function '{}' not found in DWARF", name))
                 })?
             } else {
-                req.args
-                    .get("addr")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .ok_or_else(|| {
-                        err_response(
-                            "E_PARAM",
-                            "missing or invalid 'addr' (hex or decimal)".into(),
-                        )
-                    })?
+                addr.ok_or_else(|| {
+                    err_response(
+                        "E_PARAM",
+                        "missing or invalid 'addr' (expected a u32 integer)".into(),
+                    )
+                })?
             };
             Ok(Command::Break { addr })
         }
         "regs" => Ok(Command::Regs),
         "mem" => {
-            let addr = req
-                .args
-                .get("addr")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| {
-                    err_response(
-                        "E_PARAM",
-                        "missing or invalid 'addr' (hex or decimal)".into(),
-                    )
-                })?;
-            let len = req
-                .args
-                .get("len")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| {
-                    err_response("E_PARAM", "missing or invalid 'len' (decimal)".into())
-                })?;
+            let addr = required_u32(req, "addr")?;
+            let len = required_u32(req, "len")?;
             Ok(Command::Mem { addr, len })
         }
         "status" => Ok(Command::Status),
@@ -370,43 +450,25 @@ pub fn json_to_command(
         "quit" => Ok(Command::Quit),
         "schema" => unreachable!(), // handled in handle_request before json_to_command
         "watch" => {
-            let (addr, size, label) = if let Some(name) =
-                req.args.get("name").and_then(|v| v.as_str())
-            {
+            let name = optional_string(req, "name")?;
+            let requested_addr = optional_u32(req, "addr")?;
+            let requested_size = optional_u32(req, "size")?;
+            let requested_label = optional_string(req, "label")?;
+            let (addr, size, label) = if let Some(name) = name {
                 let var = dwarf
-                    .and_then(|d| d.variable_info(name).cloned())
+                    .and_then(|d| d.variable_info(&name).cloned())
                     .ok_or_else(|| {
                         err_response("E_PARAM", format!("variable '{}' not found in DWARF", name))
                     })?;
-                let size = req
-                    .args
-                    .get("size")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(var.size);
-                let label = req
-                    .args
-                    .get("label")
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .or_else(|| Some(name.to_string()));
+                let size = requested_size.unwrap_or(var.size);
+                let label = requested_label.or(Some(name));
                 (var.addr, size, label)
             } else {
-                let addr = req
-                    .args
-                    .get("addr")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'addr'".into()))?;
-                let size = req
-                    .args
-                    .get("size")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .ok_or_else(|| err_response("E_PARAM", "missing or invalid 'size'".into()))?;
-                let label = req
-                    .args
-                    .get("label")
-                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                let addr = requested_addr
+                    .ok_or_else(|| err_response("E_PARAM", "missing 'addr'".into()))?;
+                let size = requested_size
+                    .ok_or_else(|| err_response("E_PARAM", "missing 'size'".into()))?;
+                let label = requested_label;
                 (addr, size, label)
             };
             if !matches!(size, 1 | 2 | 4 | 8) {
@@ -415,24 +477,26 @@ pub fn json_to_command(
             Ok(Command::Watch { addr, size, label })
         }
         "buffer" => {
-            let since = req.args.get("since").and_then(|v| v.as_u64());
-            let watch_id = req
-                .args
-                .get("watch_id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
+            let since = optional_u64(req, "since")?;
+            let watch_id = optional_u64(req, "watch_id")?
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| {
+                    err_response(
+                        "E_PARAM",
+                        "'watch_id' is outside the platform usize range".into(),
+                    )
+                })?;
             Ok(Command::Buffer { since, watch_id })
         }
         "serial" => {
-            let since = req.args.get("since").and_then(|v| v.as_u64());
-            let channel = req
-                .args
-                .get("channel")
-                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            let since = optional_u64(req, "since")?;
+            let channel = optional_string(req, "channel")?;
             Ok(Command::Serial { since, channel })
         }
         "info" => {
-            let subcmd = match req.args.get("subcmd").and_then(|v| v.as_str()) {
+            let requested_subcmd = optional_string(req, "subcmd")?;
+            let subcmd = match requested_subcmd.as_deref() {
                 Some("functions") | Some("funcs") => InfoSubcmd::Functions,
                 Some("variables") | Some("vars") => InfoSubcmd::Variables,
                 Some(name) => InfoSubcmd::Symbol(name.to_string()),
@@ -474,6 +538,14 @@ pub struct JsonSession {
     dwarf: Option<DwarfResolver>,
 }
 
+enum InputMessage {
+    Line(String),
+    Eof,
+    Error(String),
+}
+
+const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 impl JsonSession {
     /// 创建 JSON-Lines 会话
     pub fn new(
@@ -496,10 +568,72 @@ impl JsonSession {
         }
     }
 
-    /// 进入主协议循环
+    /// Register startup watches and optionally resume the target.
+    ///
+    /// Watch specifications use the same parser as REPL commands. If `run_target` is true,
+    /// resume follows registration so any watch targets are sampled from the first run.
+    /// Returns an error for invalid watches, a non-halted session, poisoned buffer locks,
+    /// or a backend resume failure.
+    pub fn initialize_startup(
+        &mut self,
+        watch_specs: &[String],
+        run_target: bool,
+    ) -> anyhow::Result<()> {
+        if self.session.state != SessionState::Halted {
+            anyhow::bail!("startup configuration requires a halted target");
+        }
+
+        let mut parsed_watches = Vec::with_capacity(watch_specs.len());
+        for spec in watch_specs {
+            let command = Command::parse(&format!("watch {spec}"), self.dwarf.as_ref())
+                .map_err(|error| anyhow::anyhow!("--watch parse error: {error}"))?;
+            let Command::Watch { addr, size, label } = command else {
+                anyhow::bail!("watch parser returned a non-watch command");
+            };
+            parsed_watches.push((addr, size, label));
+        }
+        {
+            let mut buffer = self
+                .buffer
+                .write()
+                .map_err(|_| anyhow::anyhow!("debug buffer lock poisoned"))?;
+            for (addr, size, label) in parsed_watches {
+                buffer.add_target(addr, size, label);
+            }
+            self.session.watch_count = buffer.targets.len();
+        }
+
+        if run_target {
+            self.execute_json(Command::Resume)
+                .map_err(|error| anyhow::anyhow!("startup resume failed: {}", error.message))?;
+        }
+        Ok(())
+    }
+
+    /// Run the CLI protocol loop until quit, EOF, or a terminal connection error.
+    ///
+    /// The input-only reader lives for this CLI process and is not joined while stdin is
+    /// open. Returns an error on input/output failures, failed recovery, or detach failure.
     pub fn run(&mut self) -> anyhow::Result<()> {
-        use std::io::{self, BufRead};
-        let stdin = io::stdin();
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        self.run_with_writer(&mut writer)
+    }
+
+    fn run_with_writer(&mut self, writer: &mut dyn std::io::Write) -> anyhow::Result<()> {
+        let run_result = self.run_loop(writer);
+        self.stop_sampler();
+        let detach_result = self.session.detach();
+        match run_result {
+            Err(error) => {
+                let _ = detach_result;
+                Err(error)
+            }
+            Ok(()) => detach_result,
+        }
+    }
+
+    fn run_loop(&mut self, writer: &mut dyn std::io::Write) -> anyhow::Result<()> {
         let attached = JsonEvent {
             event: "attached".into(),
             data: json!({
@@ -509,44 +643,74 @@ impl JsonSession {
                 "state": format!("{:?}", self.session.state),
             }),
         };
-        Self::send_json(&attached);
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break, // EOF / Ctrl+C
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
+        Self::write_json(writer, &attached)?;
 
-            // 事件检测（仅在 Running 态有意义）
-            self.check_events();
-
-            // 日志事件推送（非阻塞检查 mpsc receiver）
-            self.push_log_events();
-
-            // 解析请求
-            let req: JsonRequest = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(e) => {
-                    Self::send_error(0, "E_PARAM", &format!("invalid JSON: {e}"));
-                    continue;
+        let (input_tx, input_rx) = mpsc::sync_channel(64);
+        let _reader = std::thread::Builder::new()
+            .name("json-stdin-reader".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    match line {
+                        Ok(line) => {
+                            if input_tx.send(InputMessage::Line(line)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = input_tx.send(InputMessage::Error(error.to_string()));
+                            return;
+                        }
+                    }
                 }
-            };
+                let _ = input_tx.send(InputMessage::Eof);
+            })?;
 
-            // 处理
-            let is_quit = self.handle_request(req);
-            if is_quit {
+        let mut next_tick = std::time::Instant::now();
+        loop {
+            let timeout = next_tick.saturating_duration_since(std::time::Instant::now());
+            let should_quit = match input_rx.recv_timeout(timeout) {
+                Ok(InputMessage::Line(line)) if !line.trim().is_empty() => {
+                    match serde_json::from_str(&line) {
+                        Ok(req) => self.handle_request(req, writer)?,
+                        Err(error) => {
+                            let response = Self::error_response(
+                                0,
+                                "E_PARAM",
+                                format!("invalid JSON: {error}"),
+                            );
+                            Self::write_json(writer, &response)?;
+                            false
+                        }
+                    }
+                }
+                Ok(InputMessage::Line(_)) => false,
+                Ok(InputMessage::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                Ok(InputMessage::Error(error)) => {
+                    anyhow::bail!("failed reading JSON stdin: {error}");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+            };
+            if should_quit {
                 break;
             }
+
+            if std::time::Instant::now() >= next_tick {
+                self.check_events(writer)?;
+                self.push_log_events(writer)?;
+                next_tick = std::time::Instant::now() + EVENT_POLL_INTERVAL;
+            }
         }
-        self.stop_sampler();
-        self.session.detach()?;
         Ok(())
     }
 
     /// 处理一条 JSON 请求。返回 true 表示应退出循环。
-    fn handle_request(&mut self, req: JsonRequest) -> bool {
+    fn handle_request(
+        &mut self,
+        req: JsonRequest,
+        writer: &mut dyn std::io::Write,
+    ) -> anyhow::Result<bool> {
         // schema 特殊处理
         if req.cmd == "schema" {
             let schema = generate_schema();
@@ -556,22 +720,22 @@ impl JsonSession {
                 data: Some(serde_json::to_value(&schema).unwrap_or_default()),
                 error: None,
             };
-            Self::send_json(&resp);
-            return false;
+            Self::write_json(writer, &resp)?;
+            return Ok(false);
         }
 
         // 映射为 Command
         let cmd = match json_to_command(&req, self.dwarf.as_ref()) {
             Ok(c) => c,
             Err(err_resp) => {
-                Self::send_json(&err_resp);
-                return false;
+                Self::write_json(writer, &err_resp)?;
+                return Ok(false);
             }
         };
 
         // quit 特殊处理
         if matches!(cmd, Command::Quit) {
-            return true;
+            return Ok(true);
         }
 
         // 状态守卫
@@ -590,8 +754,8 @@ impl JsonSession {
                     ),
                 }),
             };
-            Self::send_json(&resp);
-            return false;
+            Self::write_json(writer, &resp)?;
+            return Ok(false);
         }
 
         // 执行
@@ -603,13 +767,13 @@ impl JsonSession {
                     data,
                     error: None,
                 };
-                Self::send_json(&resp);
+                Self::write_json(writer, &resp)?;
             }
             Err(err) => {
-                Self::send_json(&Self::error_response(req.id, err.code, err.message));
+                Self::write_json(writer, &Self::error_response(req.id, err.code, err.message))?;
             }
         }
-        false
+        Ok(false)
     }
 
     /// 执行命令并返回 JSON data
@@ -641,17 +805,7 @@ impl JsonSession {
                     .map_err(Self::backend_failure)?;
                 self.session.state = SessionState::Running;
                 // 如果有 watch target，启动采样线程
-                let watch_count = self.buffer.read().unwrap().targets.len();
-                if watch_count > 0 {
-                    let backend = self.session.shared_backend();
-                    let buffer = self.buffer.clone();
-                    let mut sampler = Sampler::new(backend, buffer, self.sampling_interval, 0);
-                    let stop_flag = sampler.stop_flag();
-                    self.sampler_stop = Some(stop_flag);
-                    self.sampler_thread = Some(std::thread::spawn(move || {
-                        sampler.run();
-                    }));
-                }
+                let watch_count = self.start_sampler();
                 Ok(Some(
                     json!({"status": "running", "sampling": watch_count > 0, "sampling_interval_ms": self.sampling_interval}),
                 ))
@@ -861,39 +1015,131 @@ impl JsonSession {
         }
     }
 
-    /// 停止采样线程（最多等待 2 秒，超时则分离线程不阻塞主线程）。
+    /// Stop the sampler and join it after its backend lock has been released.
     fn stop_sampler(&mut self) {
         if let Some(stop) = self.sampler_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(handle) = self.sampler_thread.take() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            // 超时 → 分离
+            let _ = handle.join();
         }
     }
 
+    fn start_sampler(&mut self) -> usize {
+        let watch_count = self.buffer.read().unwrap().targets.len();
+        if watch_count > 0 && self.sampler_thread.is_none() {
+            let backend = self.session.shared_backend();
+            let buffer = self.buffer.clone();
+            let mut sampler = Sampler::new(backend, buffer, self.sampling_interval, 0);
+            self.sampler_stop = Some(sampler.stop_flag());
+            self.sampler_thread = Some(std::thread::spawn(move || sampler.run()));
+        }
+        watch_count
+    }
+
     /// 检测目标是否已 halt（Running → Halted 状态切换时推送事件）
-    fn check_events(&mut self) {
+    fn check_events(&mut self, writer: &mut dyn std::io::Write) -> anyhow::Result<()> {
         if self.session.state != SessionState::Running {
-            return;
+            return Ok(());
         }
-        // 一次性锁定 backend，连续完成所有检测操作
-        let mut guard = self.session.backend.lock().expect("backend lock poisoned");
-        let active_core = guard.active_core();
-        if !guard.is_halted(Some(active_core)) {
-            return;
+        let (active_core, halted, disconnected) = {
+            let mut guard =
+                self.session.backend.lock().map_err(|_| {
+                    anyhow::anyhow!("backend lock poisoned while polling halt state")
+                })?;
+            let active_core = guard.active_core();
+            let connected_before_poll = guard.is_connected();
+            let halted = if connected_before_poll {
+                guard.poll_halted(Some(active_core))
+            } else {
+                false
+            };
+            (
+                active_core,
+                halted,
+                !connected_before_poll || !guard.is_connected(),
+            )
+        };
+        if disconnected {
+            return self.recover_probe(writer);
         }
-        // 目标已 halt
+        if !halted {
+            return Ok(());
+        }
         self.session.state = SessionState::Halted;
-        drop(guard); // 释放锁，允许 stop_sampler 获取
         self.stop_sampler();
+        self.write_halted_event(writer, active_core)
+    }
+
+    fn recover_probe(&mut self, writer: &mut dyn std::io::Write) -> anyhow::Result<()> {
+        self.session.state = SessionState::Recovering;
+        self.stop_sampler();
+        Self::write_json(
+            writer,
+            &JsonEvent {
+                event: "probe_recovering".into(),
+                data: json!({"code": "E_PROBE"}),
+            },
+        )?;
+
+        let recovery = (|| -> anyhow::Result<(usize, bool)> {
+            let mut guard = self
+                .session
+                .backend
+                .lock()
+                .map_err(|_| anyhow::anyhow!("backend lock poisoned during probe recovery"))?;
+            guard.try_recover()?;
+            if !guard.is_connected() {
+                anyhow::bail!("probe recovery returned without reconnecting");
+            }
+            let active_core = guard.active_core();
+            let halted = guard.poll_halted(Some(active_core));
+            if !guard.is_connected() {
+                anyhow::bail!("probe disconnected while refreshing target state");
+            }
+            Ok((active_core, halted))
+        })();
+
+        let (active_core, halted) = match recovery {
+            Ok(state) => state,
+            Err(error) => {
+                let message = error.to_string();
+                Self::write_json(
+                    writer,
+                    &JsonEvent {
+                        event: "probe_lost".into(),
+                        data: json!({"code": "E_PROBE_LOST", "message": message}),
+                    },
+                )?;
+                anyhow::bail!("probe recovery failed: {error}");
+            }
+        };
+
+        if halted {
+            self.session.state = SessionState::Halted;
+            self.write_halted_event(writer, active_core)
+        } else {
+            self.session.state = SessionState::Running;
+            let sampling = self.start_sampler() > 0;
+            Self::write_json(
+                writer,
+                &JsonEvent {
+                    event: "probe_recovered".into(),
+                    data: json!({
+                        "state": "Running",
+                        "sampling": sampling,
+                        "sampling_interval_ms": self.sampling_interval,
+                    }),
+                },
+            )
+        }
+    }
+
+    fn write_halted_event(
+        &self,
+        writer: &mut dyn std::io::Write,
+        active_core: usize,
+    ) -> anyhow::Result<()> {
         let snapshot = self
             .session
             .backend
@@ -926,14 +1172,15 @@ impl JsonSession {
                     })),
             }),
         };
-        Self::send_json(&event);
+        Self::write_json(writer, &event)?;
+        Ok(())
     }
 
     /// 从 mpsc receiver 拉取日志事件并推送到 stdout（非阻塞）。
-    fn push_log_events(&mut self) {
+    fn push_log_events(&mut self, writer: &mut dyn std::io::Write) -> anyhow::Result<()> {
         let rx = match self.log_event_rx.as_mut() {
             Some(r) => r,
-            None => return,
+            None => return Ok(()),
         };
         // 尝试接收所有已到达的事件，但最多 10 条/轮以避免阻塞主循环
         for _ in 0..10 {
@@ -946,7 +1193,7 @@ impl JsonSession {
                             "data": event.data,
                         }),
                     };
-                    Self::send_json(&json_event);
+                    Self::write_json(writer, &json_event)?;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -956,6 +1203,7 @@ impl JsonSession {
                 }
             }
         }
+        Ok(())
     }
 
     fn backend_failure(err: anyhow::Error) -> JsonExecError {
@@ -977,19 +1225,11 @@ impl JsonSession {
         }
     }
 
-    // ── I/O 辅助方法 ──
-
-    /// 向 stdout 写入一行 JSON
-    fn send_json<T: Serialize>(msg: &T) {
-        match serde_json::to_string(msg) {
-            Ok(json_str) => println!("{json_str}"),
-            Err(e) => eprintln!("[FATAL] JSON serialization failed: {e}"),
-        }
-    }
-
-    /// 快速发送错误响应
-    fn send_error(id: u64, code: &str, message: &str) {
-        Self::send_json(&Self::error_response(id, code, message.into()));
+    fn write_json<T: Serialize>(writer: &mut dyn std::io::Write, msg: &T) -> anyhow::Result<()> {
+        serde_json::to_writer(&mut *writer, msg)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
     }
 }
 
@@ -1109,20 +1349,170 @@ mod tests {
     #[test]
     fn schema_consistency() {
         let schema = generate_schema();
-        // 14 个命令: halt, resume, step, break, regs, mem, status, help, quit, schema, watch, buffer, serial, info
-        assert_eq!(schema.commands.len(), 14);
-        assert!(
+        let cases = [
+            ("halt", json!({})),
+            ("resume", json!({})),
+            ("step", json!({})),
+            ("break", json!({"addr": 256})),
+            ("regs", json!({})),
+            ("mem", json!({"addr": 256, "len": 4})),
+            ("status", json!({})),
+            ("help", json!({})),
+            ("quit", json!({})),
+            ("watch", json!({"addr": 256, "size": 4})),
+            ("buffer", json!({})),
+            ("serial", json!({})),
+            ("info", json!({"subcmd": "functions"})),
+        ];
+        assert_eq!(schema.commands.len(), cases.len() + 1);
+        assert_eq!(
             schema
                 .commands
                 .iter()
-                .any(|command| command.name == "resume")
+                .map(|command| command.name.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            cases
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(std::iter::once("schema"))
+                .collect()
         );
+
+        for (name, args) in cases {
+            let meta = schema
+                .commands
+                .iter()
+                .find(|command| command.name == name)
+                .unwrap();
+            let req = JsonRequest {
+                cmd: name.into(),
+                args: args.as_object().unwrap().clone().into_iter().collect(),
+                id: 1,
+            };
+            let command = json_to_command(&req, None).unwrap();
+            let actual_states = command
+                .valid_states()
+                .unwrap_or(&[])
+                .iter()
+                .map(|state| format!("{state:?}"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                meta.valid_states, actual_states,
+                "state metadata for {name}"
+            );
+        }
+
+        let expected_args: HashMap<&str, Vec<(&str, &str, bool)>> = HashMap::from([
+            (
+                "break",
+                vec![("addr", "u32", false), ("name", "string", false)],
+            ),
+            ("mem", vec![("addr", "u32", true), ("len", "u32", true)]),
+            (
+                "watch",
+                vec![
+                    ("addr", "u32", false),
+                    ("name", "string", false),
+                    ("size", "u32", false),
+                    ("label", "string", false),
+                ],
+            ),
+            (
+                "buffer",
+                vec![("since", "u64", false), ("watch_id", "usize", false)],
+            ),
+            (
+                "serial",
+                vec![("since", "u64", false), ("channel", "string", false)],
+            ),
+            ("info", vec![("subcmd", "string", true)]),
+        ]);
+        for command in &schema.commands {
+            let actual_args = command
+                .args
+                .as_ref()
+                .map(|args| {
+                    args.iter()
+                        .map(|arg| (arg.name.as_str(), arg.arg_type.as_str(), arg.required))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                actual_args,
+                expected_args
+                    .get(command.name.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+                "argument metadata for {}",
+                command.name
+            );
+        }
+
+        let event_metadata = schema
+            .events
+            .iter()
+            .map(|event| (event.name.as_str(), event.error_code.as_deref()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(event_metadata.len(), 6);
+        assert_eq!(
+            event_metadata.get("probe_recovering"),
+            Some(&Some("E_PROBE"))
+        );
+        assert_eq!(
+            event_metadata.get("probe_lost"),
+            Some(&Some("E_PROBE_LOST"))
+        );
+        assert_eq!(event_metadata.get("probe_recovered"), Some(&None));
+
         assert!(
             !schema
                 .commands
                 .iter()
                 .any(|command| command.name == "continue")
         );
+    }
+
+    #[test]
+    fn json_u32_parameters_reject_overflow() {
+        let requests = [
+            ("break", json!({"addr": 4_294_967_296u64})),
+            ("mem", json!({"addr": 4_294_967_296u64, "len": 4})),
+            ("mem", json!({"addr": 4, "len": 4_294_967_296u64})),
+            ("watch", json!({"addr": 4_294_967_296u64, "size": 4})),
+            ("watch", json!({"addr": 4, "size": 4_294_967_296u64})),
+        ];
+
+        for (cmd, args) in requests {
+            let req = JsonRequest {
+                cmd: cmd.into(),
+                args: args.as_object().unwrap().clone().into_iter().collect(),
+                id: 9,
+            };
+            let error = json_to_command(&req, None).unwrap_err();
+            assert_eq!(error.error.unwrap().code, "E_PARAM", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn supplied_optional_parameter_types_are_validated() {
+        let requests = [
+            ("break", json!({"addr": 4, "name": false})),
+            ("watch", json!({"addr": 4, "size": 4, "label": null})),
+            ("buffer", json!({"since": "1"})),
+            ("buffer", json!({"watch_id": -1})),
+            ("serial", json!({"channel": 4})),
+            ("info", json!({"subcmd": []})),
+        ];
+
+        for (cmd, args) in requests {
+            let req = JsonRequest {
+                cmd: cmd.into(),
+                args: args.as_object().unwrap().clone().into_iter().collect(),
+                id: 10,
+            };
+            let error = json_to_command(&req, None).unwrap_err();
+            assert_eq!(error.error.unwrap().code, "E_PARAM", "{cmd}");
+        }
     }
 
     #[test]

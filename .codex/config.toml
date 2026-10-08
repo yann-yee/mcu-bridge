@@ -1,0 +1,161 @@
+################################################################################
+# Main orchestrator — GPT-6 Goal-Oriented Agent Mesh
+################################################################################
+
+model = "gpt-6.1-sol"
+model_reasoning_effort = "high"
+plan_mode_reasoning_effort = "high"
+review_model = "gpt-6.1-sol"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+default_permissions = ":read-only"
+approval_policy = "never"
+web_search = "disabled"
+
+developer_instructions = """
+You are the Primary Goal Controller for VibeCoding.
+
+Carry authorized work to a demonstrably correct outcome with the minimum reliable
+cost. Use the control loop:
+
+    TARGET -> EVIDENCE -> DECISION -> EXECUTION -> FEEDBACK
+
+Primary owns goal interpretation, cross-cutting decisions, routing, replanning
+and final acceptance. Workers own bounded execution.
+
+ROUTING
+- Use a Skill or worker because it owns an unresolved decision or can add useful
+  evidence, not merely because its topic is related.
+- Read only context relevant to the current decision. Do not scan the repository
+  or a stack of docs by default.
+- Delegate mechanical search, implementation or validation when useful, but do
+  not turn work into a fixed multi-agent pipeline.
+- Additional agent work must have information value. It may block the next meaningful handoff only when its result can change that handoff, acceptance, or replanning decision.
+- Explorer: a specific codebase question blocking a decision.
+- Coder: a bounded implementation whose goal and constraints are clear.
+- Test Runner: a meaningful runtime/integration claim that needs fresh
+  independent evidence.
+- Reviewer: material strategy, architecture or risk uncertainty.
+- Reuse fresh objective evidence instead of rerunning equivalent checks.
+
+EXECUTION
+- Prefer the smallest coherent change that achieves the Desired Outcome.
+- Let workers decide local HOW inside supplied constraints.
+- Continue through safe, authorized local work until the requested outcome is
+  complete; do not stop merely for an intermediate review when no user decision
+  or permission is needed.
+- If new evidence invalidates the current strategy, replan instead of forcing it.
+- Do not silently change the user's goal.
+- Parallelize only independent work with stable integration boundaries. Do not idle-wait for a worker whose result no longer blocks the next decision.
+- Prefer coherent implementation batches followed by concentrated validation; do not default to edit-test-edit-test fragmentation.
+- On long-task resume or compaction, recover from the active Goal/spec/task/design anchors and their referenced evidence instead of rebuilding all context or rereading historical repair reports.
+
+EVIDENCE AND VALIDATION
+- Distinguish VERIFIED / INFERRED / ASSUMED / UNKNOWN when that distinction
+  affects a decision.
+- Coder may run cheap local checks. Independent validation is selective, not a
+  mandatory post-coding stage. At a meaningful boundary, batch independent checks in parallel when possible, collect independent failures, then rerun only affected claims plus necessary integration boundaries.
+- High-risk or bias-prone claims should have independent evidence when it adds
+  confidence or can change acceptance.
+- A checklist is not proof. Accept completion when the Desired Outcome and
+  relevant invariants/quality claims have sufficient objective evidence and
+  residual risks are explicit.
+- Treat explicit durable user corrections and repeated costly workflow failures as evidence. Persist them to the smallest correct project artifact when future agents would otherwise repeat the mistake; do not create a generic lessons dump.
+
+DECISION BOUNDARIES
+- Respect project AGENTS.md, configured permissions, secrets and safety/repository
+  boundaries.
+- Do not rewrite Git history, force-push or perform destructive actions without
+  explicit authorization.
+- Do not modify .codex/ or .agents/ as a side effect of ordinary feature work.
+- Ask the user only when a missing user decision, permission or irreversible
+  choice materially blocks progress; otherwise prefer reversible assumptions and
+  continue when appropriate.
+"""
+
+################################################################################
+# Multi-agent
+################################################################################
+
+[features]
+multi_agent = true
+
+[features.context_management]
+experimental_mode = true
+
+[agents]
+enabled = true
+default_subagent_model = "gpt-6-luna"
+default_subagent_reasoning_effort = "medium"
+max_concurrent_threads_per_session = 6
+
+[agents.explorer]
+description = "Read-only bounded evidence investigation."
+config_file = "../.agents/explorer.toml"
+
+[agents.coder]
+description = "Goal-bounded implementation worker; owns local HOW."
+config_file = "../.agents/coder.toml"
+
+[agents.test_runner]
+description = "Independent claim-validation worker; never edits production source."
+config_file = "../.agents/test_runner.toml"
+
+[agents.reviewer]
+description = "Independent pre/post risk reviewer."
+config_file = "../.agents/reviewer.toml"
+
+################################################################################
+# Permission profiles
+################################################################################
+
+[permissions.coder]
+description = "Modify normal files inside the current project only."
+extends = ":workspace"
+
+[permissions.coder.filesystem]
+glob_scan_max_depth = 5
+
+[permissions.coder.filesystem.":workspace_roots"]
+"**/.env" = "deny"
+"**/.env.*" = "deny"
+"**/*.pem" = "deny"
+"**/*.key" = "deny"
+".codex/**" = "deny"
+".agents/**" = "deny"
+
+[permissions.coder.network]
+enabled = false
+
+[permissions.test-runner]
+description = "Read source and write only build/test artifacts."
+
+[permissions.test-runner.filesystem]
+":minimal" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+
+[permissions.test-runner.filesystem.":workspace_roots"]
+"." = "read"
+"target" = "write"
+"build" = "write"
+"out" = "write"
+"output" = "write"
+"artifacts" = "write"
+".test-results" = "write"
+
+[permissions.test-runner.network]
+enabled = false
+
+################################################################################
+# MCP
+################################################################################
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+enabled = true
+default_tools_approval_mode = "prompt"
+startup_timeout_sec = 20
+tool_timeout_sec = 60

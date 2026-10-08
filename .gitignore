@@ -28,3 +28,6 @@ user_plan/
 
 # MCP tool caches
 .codegraph/
+
+# Machine-local personal resource locations
+.agents/resources.local.md

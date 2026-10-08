@@ -24,7 +24,7 @@ use crate::buffer::serial::SerialMonitor;
 use crate::buffer::{DebugBuffer, LogBuffer, Sampler};
 use crate::cli::init;
 use crate::cli::json_session::JsonSession;
-use crate::config::{AppConfig, ChipConfig, FlashOpts, FlashSection};
+use crate::config::{AppConfig, ChipConfig, FlashOpts, FlashSection, WatchConfig};
 use crate::dwarf::DwarfResolver;
 use crate::log::detect_log_backend;
 use crate::operations::capture_target_snapshot;
@@ -569,23 +569,13 @@ impl DebugRepl {
         Ok(())
     }
 
-    /// 停止采样线程（最多等待 2 秒，超时则分离线程不阻塞主线程）。
+    /// 停止并等待采样线程退出。
     fn stop_sampler(&mut self) {
         if let Some(stop) = self.sampler_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(handle) = self.sampler_thread.take() {
-            // 等最多 2s 让采样线程看到 stop_flag 并退出
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            // 超时：分离线程（采样卡在 read_mem 硬件超时中），不阻塞主线程
-            // JoinHandle drop → 线程被分离，它会在 http 下回归
+            let _ = handle.join();
         }
     }
 
@@ -996,6 +986,43 @@ fn create_debug_backend(
     create_backend_instance(&backend_name, openocd_cfg)
 }
 
+fn resolve_sampling_settings(
+    cli_interval_ms: Option<u64>,
+    watch: Option<&WatchConfig>,
+) -> anyhow::Result<(u64, usize)> {
+    let interval_ms = cli_interval_ms
+        .or_else(|| watch.map(|config| config.interval_ms))
+        .unwrap_or(10);
+    let buffer_capacity = watch.map(|config| config.buffer_size).unwrap_or(128);
+    if interval_ms == 0 {
+        anyhow::bail!("sampling interval must be greater than zero milliseconds");
+    }
+    if buffer_capacity == 0 {
+        anyhow::bail!("watch buffer size must be greater than zero");
+    }
+    Ok((interval_ms, buffer_capacity))
+}
+
+fn initialize_repl_startup(
+    repl: &mut DebugRepl,
+    watch_specs: &[String],
+    run_target: bool,
+) -> anyhow::Result<()> {
+    for watch_spec in watch_specs {
+        let (addr, size, label) = resolve_watch_spec(watch_spec, repl.dwarf.as_ref())
+            .map_err(|error| anyhow::anyhow!("--watch parse error: {error}"))?;
+        repl.cmd_watch(addr, size, label)?;
+    }
+    if run_target {
+        repl.execute(Command::Resume)?;
+    }
+    Ok(())
+}
+
+fn should_run_at_start(continue_on_start: bool, halt_on_start: bool) -> bool {
+    continue_on_start && !halt_on_start
+}
+
 /// 处理 debug 子命令
 pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     // 校验 ELF 文件存在
@@ -1004,6 +1031,8 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     }
 
     let config = load_debug_config(args.config.as_ref())?;
+    let (sampling_interval, buffer_capacity) =
+        resolve_sampling_settings(args.sampling_interval, config.as_ref().map(|c| &c.watch))?;
 
     // 解析芯片配置 + 烧录参数
     let (chip, flash_opts) =
@@ -1017,7 +1046,7 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
     )?;
 
     // 连接并创建会话
-    let mut session = Session::attach(&chip, backend)?;
+    let session = Session::attach(&chip, backend)?;
     if !args.json {
         println!(
             "[OK] attached to {}, {} core(s) via {}",
@@ -1054,18 +1083,8 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
         }
     }
 
-    // halt-on-start 优先；仅当未指定 halt-on-start 且指定了 continue 时才 resume
-    if !args.halt_on_start && args.continue_ {
-        session.backend.lock().expect("backend lock").resume(None)?;
-        session.state = SessionState::Running;
-        if !args.json {
-            println!("[OK] target running");
-        }
-    }
-
     // 采样与观测配置
-    let sampling_interval = args.sampling_interval.unwrap_or(10);
-    let buffer_capacity = 128;
+    let run_target = should_run_at_start(args.continue_, args.halt_on_start);
 
     // 日志通道检测（可选 — 不阻止会话继续）
     let log_buffer = Arc::new(RwLock::new(LogBuffer::new(4096)));
@@ -1107,28 +1126,21 @@ pub fn handle(args: &DebugArgs) -> anyhow::Result<()> {
         if let Some(ch) = detect_log_backend(shared_backend, args.serial_port.clone(), 0) {
             let mut monitor = SerialMonitor::new(ch, log_buffer, log_event_tx, 100);
             monitor.start();
-            // SerialMonitor 线程在 JsonSession::run() 期间运行
-            // 当 JsonSession 退出时，monitor 会被 drop 自动停止
-            js.run()?;
-            // 确保 SerialMonitor 在会话结束前停止
-            let _ = monitor.stop();
+            // Keep the monitor alive through startup and the JSON event loop.
+            let session_result = js
+                .initialize_startup(&args.watch_targets, run_target)
+                .and_then(|()| js.run());
+            let monitor_result = monitor.stop();
+            session_result?;
+            monitor_result?;
         } else {
             log::info!("no log backend available, running without serial monitor");
+            js.initialize_startup(&args.watch_targets, run_target)?;
             js.run()?;
         }
     } else {
         let mut repl = DebugRepl::new(session, sampling_interval, buffer_capacity, dwarf);
-
-        // 处理 --watch 参数（启动时添加观测目标）
-        for watch_spec in &args.watch_targets {
-            let (addr, size, label) = DebugBuffer::parse_watch_spec(watch_spec)
-                .map_err(|e| anyhow::anyhow!("--watch parse error: {e}"))?;
-            repl.cmd_watch(addr, size, label)?;
-        }
-
-        // 如果指定了 --continue_ 且有 watch target，resume 会自动启动采样
-        // 如果指定了 --watch 但没有 --continue_，用户手动 resume 时启动采样
-
+        initialize_repl_startup(&mut repl, &args.watch_targets, run_target)?;
         repl.run()?;
     }
 
@@ -1429,6 +1441,227 @@ mod tests {
         assert!(
             err_msg.contains("unknown backend"),
             "Expected 'unknown backend', got: {err_msg}"
+        );
+    }
+
+    struct StartupMockProbe {
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl DebugProbe for StartupMockProbe {
+        fn backend_name(&self) -> &'static str {
+            "startup-mock"
+        }
+
+        fn attach(&mut self, _chip: &ChipConfig) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn try_recover(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn flash(&mut self, _elf: &std::path::Path, _opts: &FlashOpts) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn halt(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push("halt");
+            Ok(())
+        }
+
+        fn resume(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push("resume");
+            Ok(())
+        }
+
+        fn step(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn core_count(&self) -> usize {
+            1
+        }
+
+        fn active_core(&self) -> usize {
+            0
+        }
+
+        fn set_breakpoint(&mut self, _addr: u32, _core: Option<usize>) -> anyhow::Result<usize> {
+            Ok(1)
+        }
+
+        fn clear_breakpoint(&mut self, _id: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_watchpoint(
+            &mut self,
+            _addr: u32,
+            _len: u32,
+            _kind: crate::probe::WatchKind,
+        ) -> anyhow::Result<usize> {
+            Ok(1)
+        }
+
+        fn clear_watchpoint(&mut self, _id: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_mem(
+            &mut self,
+            _addr: u32,
+            len: u32,
+            _core: Option<usize>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.calls.lock().unwrap().push("read_mem");
+            Ok(vec![42; len as usize])
+        }
+
+        fn write_mem(
+            &mut self,
+            _addr: u32,
+            _data: &[u8],
+            _core: Option<usize>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_regs(
+            &mut self,
+            _core: Option<usize>,
+        ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn is_halted(&mut self, _core: Option<usize>) -> bool {
+            false
+        }
+    }
+
+    fn startup_repl() -> (DebugRepl, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Box<dyn DebugProbe> = Box::new(StartupMockProbe {
+            calls: calls.clone(),
+        });
+        let session = Session {
+            state: SessionState::Halted,
+            chip_name: "mock-chip".into(),
+            backend_name: "startup-mock".into(),
+            core_count: 1,
+            pc: None,
+            bp_count: 0,
+            watch_count: 0,
+            backend: Arc::new(std::sync::Mutex::new(backend)),
+        };
+        (DebugRepl::new(session, 1, 8, None), calls)
+    }
+
+    #[test]
+    fn startup_watch_is_registered_before_resume_and_is_sampled() {
+        let (mut repl, calls) = startup_repl();
+        initialize_repl_startup(
+            &mut repl,
+            &["0x20000000:4:counter".into()],
+            should_run_at_start(true, false),
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while repl
+            .buffer
+            .read()
+            .unwrap()
+            .samples
+            .values()
+            .all(Vec::is_empty)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let sample_count: usize = repl
+            .buffer
+            .read()
+            .unwrap()
+            .samples
+            .values()
+            .map(Vec::len)
+            .sum();
+        repl.stop_sampler();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.first(), Some(&"resume"));
+        assert!(calls.contains(&"read_mem"));
+        assert_eq!(repl.session.state, SessionState::Running);
+        assert_eq!(repl.buffer.read().unwrap().targets.len(), 1);
+        assert!(sample_count > 0);
+    }
+
+    #[test]
+    fn startup_watch_without_continue_stays_halted() {
+        let (mut repl, calls) = startup_repl();
+        initialize_repl_startup(&mut repl, &["0x20000000:4".into()], false).unwrap();
+
+        assert_eq!(repl.session.state, SessionState::Halted);
+        assert!(repl.sampler_thread.is_none());
+        assert!(!calls.lock().unwrap().contains(&"resume"));
+    }
+
+    #[test]
+    fn startup_continue_without_watch_runs_without_sampler() {
+        let (mut repl, calls) = startup_repl();
+        initialize_repl_startup(&mut repl, &[], should_run_at_start(true, false)).unwrap();
+
+        assert_eq!(repl.session.state, SessionState::Running);
+        assert!(repl.sampler_thread.is_none());
+        assert_eq!(calls.lock().unwrap().as_slice(), &["resume"]);
+    }
+
+    #[test]
+    fn halt_on_start_suppresses_requested_continue() {
+        let (mut repl, calls) = startup_repl();
+        let run_target = should_run_at_start(true, true);
+        initialize_repl_startup(&mut repl, &["0x20000000:4".into()], run_target).unwrap();
+
+        assert_eq!(repl.session.state, SessionState::Halted);
+        assert!(repl.sampler_thread.is_none());
+        assert!(!calls.lock().unwrap().contains(&"resume"));
+    }
+
+    #[test]
+    fn sampling_settings_follow_cli_config_default_precedence() {
+        let config = WatchConfig {
+            interval_ms: 25,
+            buffer_size: 64,
+        };
+
+        assert_eq!(resolve_sampling_settings(None, None).unwrap(), (10, 128));
+        assert_eq!(
+            resolve_sampling_settings(None, Some(&config)).unwrap(),
+            (25, 64)
+        );
+        assert_eq!(
+            resolve_sampling_settings(Some(5), Some(&config)).unwrap(),
+            (5, 64)
+        );
+        assert!(resolve_sampling_settings(Some(0), Some(&config)).is_err());
+        assert!(
+            resolve_sampling_settings(
+                None,
+                Some(&WatchConfig {
+                    interval_ms: 0,
+                    ..config
+                })
+            )
+            .is_err()
         );
     }
 }

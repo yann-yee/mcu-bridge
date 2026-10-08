@@ -8,11 +8,29 @@
 //! 混合模式 Q2=C：实时事件推送 + ring buffer 备份。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::buffer::LogBuffer;
 use crate::log::LogChannel;
+
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn wait_while_running(stop_flag: &AtomicBool, duration: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let remaining = duration.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(STOP_POLL_INTERVAL));
+    }
+}
 
 /// 日志事件（用于 JSON-Lines 实时推送）。
 #[derive(Debug, Clone)]
@@ -97,11 +115,17 @@ impl SerialMonitor {
                         break;
                     }
 
-                    let mut guard = match channel.lock() {
+                    let mut guard = match channel.try_lock() {
                         Ok(g) => g,
-                        Err(_) => {
+                        Err(TryLockError::Poisoned(_)) => {
                             log::error!("serial monitor: channel lock poisoned");
                             break;
+                        }
+                        Err(TryLockError::WouldBlock) => {
+                            if !wait_while_running(&stop_flag, STOP_POLL_INTERVAL) {
+                                break;
+                            }
+                            continue;
                         }
                     };
 
@@ -109,7 +133,9 @@ impl SerialMonitor {
                         Ok(0) => {
                             // 无数据：释放锁后短暂 sleep 避免忙等待
                             drop(guard);
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            if !wait_while_running(&stop_flag, Duration::from_millis(5)) {
+                                break;
+                            }
                             continue;
                         }
                         Ok(n) => {
@@ -148,7 +174,9 @@ impl SerialMonitor {
                         Err(e) => {
                             log::warn!("serial monitor read error: {e}");
                             drop(guard);
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            if !wait_while_running(&stop_flag, Duration::from_millis(50)) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -196,7 +224,7 @@ impl SerialMonitor {
 impl Drop for SerialMonitor {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        // 不阻塞 drop — 线程会因 stop_flag 自行退出
+        // Drop joins the receiver; an active LogChannel::read must return first.
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -208,7 +236,7 @@ mod tests {
     use super::*;
     use crate::buffer::LogBuffer;
     use crate::log::LogChannel;
-    use std::sync::{Arc, RwLock, mpsc};
+    use std::sync::{Arc, Condvar, RwLock, mpsc};
     use std::time::Duration;
 
     /// 一个简单的 mock LogChannel，用于 SerialMonitor 测试。
@@ -264,6 +292,49 @@ mod tests {
         }
 
         fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingChannel {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        started: Option<mpsc::Sender<()>>,
+        lifecycle: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl LogChannel for BlockingChannel {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn open(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read(&mut self, _buf: &mut [u8]) -> anyhow::Result<usize> {
+            self.lifecycle.lock().unwrap().push("read_started");
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            let (released, condition) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            self.lifecycle.lock().unwrap().push("read_finished");
+            Ok(0)
+        }
+
+        fn write(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_writable(&self) -> bool {
+            false
+        }
+
+        fn close(&mut self) -> anyhow::Result<()> {
+            self.lifecycle.lock().unwrap().push("closed");
             Ok(())
         }
     }
@@ -347,5 +418,62 @@ mod tests {
         }
         assert!(received > 0, "should have received some events");
         println!("received {received} events in 100ms (rate limit 5/sec)");
+    }
+
+    #[test]
+    fn test_serial_monitor_stop_joins_active_read_before_closing_channel() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let channel = Box::new(BlockingChannel {
+            gate: gate.clone(),
+            started: Some(started_tx),
+            lifecycle: lifecycle.clone(),
+        });
+        let buffer = Arc::new(RwLock::new(LogBuffer::new(8)));
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut monitor = SerialMonitor::new(channel, buffer, event_tx, 0);
+        monitor.start();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let stop_handle = std::thread::spawn(move || {
+            monitor.stop().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+
+        let (released, condition) = &*gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop_handle.join().unwrap();
+
+        assert_eq!(
+            *lifecycle.lock().unwrap(),
+            vec!["read_started", "read_finished", "closed"]
+        );
+    }
+
+    #[test]
+    fn test_serial_monitor_drop_interrupts_channel_lock_wait_and_joins() {
+        let channel = Box::new(MockChannel::new("empty", b""));
+        let buffer = Arc::new(RwLock::new(LogBuffer::new(8)));
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut monitor = SerialMonitor::new(channel, buffer, event_tx, 0);
+        let channel_ref = monitor.channel_ref().clone();
+        let channel_guard = channel_ref.lock().unwrap();
+        monitor.start();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let drop_handle = std::thread::spawn(move || {
+            drop(monitor);
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_millis(250)).unwrap();
+
+        drop(channel_guard);
+        drop_handle.join().unwrap();
     }
 }

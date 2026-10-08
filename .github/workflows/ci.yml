@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y libudev-dev
 
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   # ── 三平台构建 + 单元测试 ──
   build-and-test:
@@ -71,15 +71,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev libusb-1.0-0-dev
 
-      - name: generate lockfile (if missing)
-        run: cargo generate-lockfile
-
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: cargo test
         if: runner.os != 'macOS'
-        run: cargo test
+        run: cargo test --locked
 
       # macOS: serialport 是 probe-rs 的传递依赖，其 IOKit 后台线程在进
       # 程退出时引发 SIGTRAP (signal 5, trace/breakpoint trap)。这是 macOS
@@ -88,4 +85,4 @@ jobs:
       # 全量测试由 Linux + Windows 覆盖。
       - name: verify compilation (macOS)
         if: runner.os == 'macOS'
-        run: cargo check --tests
+        run: cargo check --tests --locked

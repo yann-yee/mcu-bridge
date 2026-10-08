@@ -1,11 +1,7 @@
-//! Semihosting 通道 — 三级 fallback 的最后一级。
+//! Semihosting 通道 — 仅在后端支持捕获时作为最终 fallback。
 //!
-//! MCU 通过 `BKPT` 异常陷入调试器来输出文本。
-//! 每次输出约 1-2ms 且会 halt CPU，性能差但无需任何硬件连接。
-//! 只读不可写，不做性能优化（协议固有缺陷）。
-//!
-//! P2 备注: probe-rs 0.31 不暴露直接的 semihosting 读 API，
-//! 此实现作为扩展点保留。真正的数据捕获需 probe-rs 未来版本支持。
+//! MCU 通过 `BKPT` 异常陷入调试器来输出文本。当前 probe-rs 后端不实现数据捕获，
+//! 因此 `open()` 会失败并让日志检测继续返回 RTT/UART 或 `None`。
 
 use std::sync::{Arc, Mutex};
 

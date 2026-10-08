@@ -42,11 +42,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev libusb-1.0-0-dev
 
-      - name: generate lockfile
-        run: cargo generate-lockfile
-
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # 打包二进制（Windows 用 zip，Linux/macOS 用 tar.gz）
       - name: package (Linux / macOS)
@@ -102,6 +99,6 @@ jobs:
             | Windows (x86_64) | `mcu-bridge-x86_64-pc-windows-msvc.zip` |
             | macOS (x86_64) | `mcu-bridge-x86_64-apple-darwin.tar.gz` |
 
-            See [CHANGELOG.md](./CHANGELOG.md) or commit history for details.
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for details.
           files: mcu-bridge-*
           generate_release_notes: true

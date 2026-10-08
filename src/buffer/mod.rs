@@ -10,8 +10,8 @@ pub mod serial;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -300,6 +300,23 @@ pub struct Sampler {
     retries_left: AtomicU32,
 }
 
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn wait_while_running(stop_flag: &AtomicBool, duration: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let remaining = duration.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(STOP_POLL_INTERVAL));
+    }
+}
+
 impl Sampler {
     /// 创建采样器。
     pub fn new(
@@ -326,24 +343,21 @@ impl Sampler {
     /// 采样主循环 — 在独立线程中运行。
     ///
     /// 每 `interval` 执行一轮采样：
-    /// 1. 检查 stop_flag
-    /// 2. sleep(interval)
-    /// 3. 锁定 backend
-    /// 4. 遍历所有 watch target 读取内存
-    /// 5. 写入 ring buffer
-    /// 6. `poll_halted()` 检测断点
-    /// 7. read_mem 失败时自动触发探针自恢复
+    /// 1. 可中断地等待 interval
+    /// 2. 在 backend 可用时获取锁
+    /// 3. 遍历所有 watch target 读取内存
+    /// 4. 写入 ring buffer
+    /// 5. `poll_halted()` 检测断点
+    /// 6. read_mem 失败时自动触发探针自恢复
     pub fn run(&mut self) {
         'outer: loop {
-            if self.stop_flag.load(Ordering::Relaxed) {
+            if !wait_while_running(&self.stop_flag, self.interval) {
                 break;
             }
-            std::thread::sleep(self.interval);
 
-            // 锁 backend
-            let mut guard = match self.backend.lock() {
-                Ok(g) => g,
-                Err(_) => continue, // 锁被毒化，跳过本轮
+            let mut guard = match self.lock_backend_while_running() {
+                Some(guard) => guard,
+                None => break,
             };
 
             // 读取所有 watch target
@@ -358,7 +372,14 @@ impl Sampler {
                 .as_micros() as u64;
 
             for (id, addr, size) in &targets {
-                let data = guard.read_mem(*addr, *size, Some(self.active_core));
+                let data = if guard.is_connected() {
+                    guard.read_mem(*addr, *size, Some(self.active_core))
+                } else {
+                    Err(anyhow::anyhow!("probe is disconnected"))
+                };
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
                 match data {
                     Ok(bytes) => {
                         let val = bytes_to_u64(&bytes);
@@ -384,34 +405,26 @@ impl Sampler {
                         // 释放 backend 锁，尝试 recovery
                         drop(guard);
                         let recovered = self.attempt_recovery();
+                        if self.stop_flag.load(Ordering::Relaxed) {
+                            self.push_gap_samples(&targets, now_us);
+                            break 'outer;
+                        }
                         if recovered {
-                            // 重新锁 backend 继续
-                            guard = match self.backend.lock() {
-                                Ok(g) => g,
-                                Err(_) => {
-                                    self.stop_flag.store(true, Ordering::Relaxed);
+                            guard = match self.lock_backend_while_running() {
+                                Some(guard) => guard,
+                                None => {
+                                    self.push_gap_samples(&targets, now_us);
                                     break 'outer;
                                 }
                             };
-                            // 记录 gap=true 采样
-                            let gap_sample = Sample {
-                                sn: 0,
-                                tick_us: now_us,
-                                val: 0,
-                                core: self.active_core,
-                                bp_flag: false,
-                                gap: true,
-                                regs: None,
-                                old_val: None,
-                                new_val: None,
-                            };
-                            if let Ok(mut buf) = self.buffer.write() {
-                                buf.push_sample(*id, gap_sample);
-                            }
+                            self.push_gap_samples(&targets, now_us);
                             self.retries_left.store(3, Ordering::Relaxed);
                         } else {
-                            log::error!("sampler: recovery failed after 3 attempts, stopping");
-                            self.stop_flag.store(true, Ordering::Relaxed);
+                            if !self.stop_flag.load(Ordering::Relaxed) {
+                                log::error!("sampler: recovery failed, stopping");
+                                self.stop_flag.store(true, Ordering::Relaxed);
+                            }
+                            self.push_gap_samples(&targets, now_us);
                             break 'outer;
                         }
                     }
@@ -422,9 +435,66 @@ impl Sampler {
             if self.stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+            if !guard.is_connected() {
+                drop(guard);
+                let recovered = self.attempt_recovery();
+                self.push_gap_samples(&targets, now_us);
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if recovered {
+                    continue 'outer;
+                }
+                log::error!("sampler: recovery failed, stopping");
+                self.stop_flag.store(true, Ordering::Relaxed);
+                break;
+            }
             if guard.poll_halted(Some(self.active_core)) {
                 self.stop_flag.store(true, Ordering::Relaxed);
                 break;
+            }
+        }
+    }
+
+    fn lock_backend_while_running(&self) -> Option<MutexGuard<'_, Box<dyn DebugProbe>>> {
+        loop {
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return None;
+            }
+
+            match self.backend.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    log::error!("sampler: backend lock poisoned, stopping");
+                    self.stop_flag.store(true, Ordering::Relaxed);
+                    return None;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if !wait_while_running(&self.stop_flag, STOP_POLL_INTERVAL) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_gap_samples(&self, targets: &[(usize, u32, u32)], tick_us: u64) {
+        if let Ok(mut buffer) = self.buffer.write() {
+            for (id, _, _) in targets {
+                buffer.push_sample(
+                    *id,
+                    Sample {
+                        sn: 0,
+                        tick_us,
+                        val: 0,
+                        core: self.active_core,
+                        bp_flag: false,
+                        gap: true,
+                        regs: None,
+                        old_val: None,
+                        new_val: None,
+                    },
+                );
             }
         }
     }
@@ -434,11 +504,13 @@ impl Sampler {
     fn attempt_recovery(&mut self) -> bool {
         let max_retries = self.retries_left.load(Ordering::Relaxed);
         for attempt in 1..=max_retries {
-            std::thread::sleep(Duration::from_millis(500));
+            if !wait_while_running(&self.stop_flag, Duration::from_millis(500)) {
+                return false;
+            }
             log::info!("sampler: recovery attempt {}/{}", attempt, max_retries);
-            let mut guard = match self.backend.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
+            let mut guard = match self.lock_backend_while_running() {
+                Some(guard) => guard,
+                None => return false,
             };
             match guard.try_recover() {
                 Ok(()) => {
@@ -477,6 +549,208 @@ fn bytes_to_u64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, mpsc};
+    use std::time::Instant;
+
+    use crate::config::{ChipConfig, FlashOpts};
+    use crate::probe::{BpId, DebugProbe, WatchKind, WpId};
+
+    type ReadGate = Arc<(Mutex<bool>, Condvar)>;
+
+    #[derive(Default)]
+    struct MockProbeState {
+        connected: AtomicBool,
+        fail_read: AtomicBool,
+        fail_recovery: AtomicBool,
+        halted: AtomicBool,
+        read_count: AtomicUsize,
+        recovery_count: AtomicUsize,
+        read_gate: Mutex<Option<ReadGate>>,
+    }
+
+    struct MockProbe {
+        state: Arc<MockProbeState>,
+    }
+
+    impl DebugProbe for MockProbe {
+        fn backend_name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn attach(&mut self, _chip: &ChipConfig) -> anyhow::Result<()> {
+            self.state.connected.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn detach(&mut self) -> anyhow::Result<()> {
+            self.state.connected.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.state.connected.load(Ordering::Relaxed)
+        }
+
+        fn try_recover(&mut self) -> anyhow::Result<()> {
+            self.state.recovery_count.fetch_add(1, Ordering::Relaxed);
+            if self.state.fail_recovery.load(Ordering::Relaxed) {
+                self.state.connected.store(false, Ordering::Relaxed);
+                anyhow::bail!("mock recovery failure");
+            }
+            self.state.connected.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn flash(&mut self, _elf: &Path, _opts: &FlashOpts) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn halt(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            self.state.halted.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn resume(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            self.state.halted.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn step(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn core_count(&self) -> usize {
+            1
+        }
+
+        fn active_core(&self) -> usize {
+            0
+        }
+
+        fn set_breakpoint(&mut self, _addr: u32, _core: Option<usize>) -> anyhow::Result<BpId> {
+            Ok(0)
+        }
+
+        fn clear_breakpoint(&mut self, _id: BpId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_watchpoint(
+            &mut self,
+            _addr: u32,
+            _len: u32,
+            _kind: WatchKind,
+        ) -> anyhow::Result<WpId> {
+            Ok(0)
+        }
+
+        fn clear_watchpoint(&mut self, _id: WpId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_mem(
+            &mut self,
+            _addr: u32,
+            len: u32,
+            _core: Option<usize>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.state.read_count.fetch_add(1, Ordering::Relaxed);
+            let gate = self.state.read_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                let (released, condition) = &*gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            if self.state.fail_read.load(Ordering::Relaxed) {
+                anyhow::bail!("mock read failure");
+            }
+            Ok(vec![0; len as usize])
+        }
+
+        fn write_mem(
+            &mut self,
+            _addr: u32,
+            _data: &[u8],
+            _core: Option<usize>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_regs(&mut self, _core: Option<usize>) -> anyhow::Result<HashMap<String, u64>> {
+            Ok(HashMap::new())
+        }
+
+        fn is_halted(&mut self, _core: Option<usize>) -> bool {
+            self.state.halted.load(Ordering::Relaxed)
+        }
+
+        fn poll_halted(&mut self, core: Option<usize>) -> bool {
+            self.is_halted(core)
+        }
+    }
+
+    fn make_sampler(
+        interval_ms: u64,
+        state: Arc<MockProbeState>,
+        target_count: usize,
+    ) -> (Sampler, Arc<RwLock<DebugBuffer>>) {
+        state.connected.store(true, Ordering::Relaxed);
+        let backend: Box<dyn DebugProbe> = Box::new(MockProbe { state });
+        let backend = Arc::new(Mutex::new(backend));
+        let buffer = Arc::new(RwLock::new(DebugBuffer::new(128)));
+        for target in 0..target_count {
+            buffer
+                .write()
+                .unwrap()
+                .add_target(0x2000_0000 + target as u32 * 4, 4, None);
+        }
+        (
+            Sampler::new(backend, buffer.clone(), interval_ms, 0),
+            buffer,
+        )
+    }
+
+    fn wait_for_read_count(state: &MockProbeState, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.read_count.load(Ordering::Relaxed) < expected {
+            assert!(Instant::now() < deadline, "sampler did not read memory");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_recovery_count(state: &MockProbeState, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.recovery_count.load(Ordering::Relaxed) < expected {
+            assert!(
+                Instant::now() < deadline,
+                "sampler did not attempt recovery"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_sample_count(buffer: &RwLock<DebugBuffer>, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sample_count = buffer
+                .read()
+                .unwrap()
+                .get_samples(None, None)
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+            if sample_count >= expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "sampler did not record samples");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn test_parse_watch_addr_size() {
@@ -589,14 +863,128 @@ mod tests {
     }
 
     #[test]
-    fn test_sampler_stop_flag() {
-        let probe: Box<dyn DebugProbe> = Box::new(crate::probe::probe_rs::ProbeRsBackend::new());
-        let buf = Arc::new(RwLock::new(DebugBuffer::new(128)));
-        let backend = Arc::new(Mutex::new(probe));
-        let mut sampler = Sampler::new(backend, buf, 10, 0);
-        sampler.stop_flag().store(true, Ordering::Relaxed);
-        sampler.run();
-        // 没有 panic 即通过
+    fn test_sampler_stops_during_very_long_interval_without_reading() {
+        let state = Arc::new(MockProbeState::default());
+        let (sampler, _) = make_sampler(1_000, state.clone(), 1);
+        let stop_flag = sampler.stop_flag();
+        let (started_tx, started_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut sampler = sampler;
+            sampler.run();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        stop_flag.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(state.read_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_sampler_stops_while_another_owner_holds_backend_lock() {
+        let state = Arc::new(MockProbeState::default());
+        let (sampler, _) = make_sampler(0, state.clone(), 1);
+        let backend = sampler.backend.clone();
+        let backend_guard = backend.lock().unwrap();
+        let stop_flag = sampler.stop_flag();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut sampler = sampler;
+            sampler.run();
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        stop_flag.store(true, Ordering::Relaxed);
+        let stopped_promptly = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        drop(backend_guard);
+        handle.join().unwrap();
+
+        assert!(stopped_promptly);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(state.read_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_sampler_stops_during_recovery_wait_and_marks_all_targets_as_gap() {
+        let state = Arc::new(MockProbeState::default());
+        state.fail_read.store(true, Ordering::Relaxed);
+        state.fail_recovery.store(true, Ordering::Relaxed);
+        let (sampler, buffer) = make_sampler(0, state.clone(), 2);
+        let stop_flag = sampler.stop_flag();
+        let handle = std::thread::spawn(move || {
+            let mut sampler = sampler;
+            sampler.run();
+        });
+        wait_for_read_count(&state, 1);
+        wait_for_recovery_count(&state, 1);
+
+        let started = Instant::now();
+        stop_flag.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(state.recovery_count.load(Ordering::Relaxed), 1);
+        let samples = buffer.read().unwrap().get_samples(None, None);
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples
+                .iter()
+                .all(|target| target.len() == 1 && target[0].gap)
+        );
+    }
+
+    #[test]
+    fn test_sampler_records_normal_samples() {
+        let state = Arc::new(MockProbeState::default());
+        // Halt at the first poll so exactly one completed sample is deterministic,
+        // independent of when the assertion thread observes the buffer.
+        state.halted.store(true, Ordering::Relaxed);
+        let (sampler, buffer) = make_sampler(1, state.clone(), 1);
+        let stop_flag = sampler.stop_flag();
+        let handle = std::thread::spawn(move || {
+            let mut sampler = sampler;
+            sampler.run();
+        });
+        wait_for_sample_count(&buffer, 1);
+        handle.join().unwrap();
+
+        let samples = buffer.read().unwrap().get_samples(None, None);
+        assert_eq!(samples[0].len(), 1);
+        assert!(!samples[0][0].gap);
+        assert!(stop_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sampler_join_waits_for_active_read_to_release_backend() {
+        let state = Arc::new(MockProbeState::default());
+        let read_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        *state.read_gate.lock().unwrap() = Some(read_gate.clone());
+        let (sampler, buffer) = make_sampler(0, state.clone(), 1);
+        let stop_flag = sampler.stop_flag();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut sampler = sampler;
+            sampler.run();
+            done_tx.send(()).unwrap();
+        });
+        wait_for_read_count(&state, 1);
+        stop_flag.store(true, Ordering::Relaxed);
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        let (released, condition) = &*read_gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+
+        assert!(buffer.read().unwrap().get_samples(None, None)[0].is_empty());
+        assert_eq!(state.read_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

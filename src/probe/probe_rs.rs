@@ -35,8 +35,6 @@ pub struct ProbeRsBackend {
     rtt: Option<probe_rs::rtt::Rtt>,
     /// RTT 附着的核编号
     rtt_core_idx: usize,
-    /// Semihosting 是否已启用
-    semihosting_enabled: bool,
     /// 探针是否在线（由 is_connected/try_recover 维护）
     connected: bool,
     /// attach 时保存的芯片配置（供 try_recover 重连使用）
@@ -56,7 +54,6 @@ impl ProbeRsBackend {
             target_halted: false,
             rtt: None,
             rtt_core_idx: 0,
-            semihosting_enabled: false,
             connected: false,
             chip_config: None,
         }
@@ -70,6 +67,44 @@ impl ProbeRsBackend {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("not attached"))?;
         Ok(s.core(idx)?)
+    }
+
+    fn set_breakpoint_with<F>(&mut self, addr: u64, set_hardware: F) -> anyhow::Result<BpId>
+    where
+        F: FnOnce(&mut Self) -> anyhow::Result<()>,
+    {
+        let id = self.next_bp_id;
+        self.next_bp_id += 1;
+        let previous_id = self.bp_map.insert(addr, id);
+
+        match set_hardware(self) {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                if let Some(previous_id) = previous_id {
+                    self.bp_map.insert(addr, previous_id);
+                } else {
+                    self.bp_map.remove(&addr);
+                }
+                self.next_bp_id -= 1;
+                Err(anyhow::anyhow!(
+                    "set breakpoint at 0x{addr:08x} failed: {e}"
+                ))
+            }
+        }
+    }
+
+    fn apply_halt_poll_result(&mut self, result: Result<bool, probe_rs::Error>) -> bool {
+        match result {
+            Ok(halted) => {
+                self.target_halted = halted;
+                halted
+            }
+            Err(probe_rs::Error::CoreDisabled(_) | probe_rs::Error::CoreNotFound(_)) => false,
+            Err(_) => {
+                self.connected = false;
+                false
+            }
+        }
     }
 }
 
@@ -106,7 +141,6 @@ impl DebugProbe for ProbeRsBackend {
         self.bp_map.clear();
         self.num_cores = 0;
         self.rtt = None;
-        self.semihosting_enabled = false;
         self.connected = false;
         self.chip_config = None;
         Ok(())
@@ -229,26 +263,11 @@ impl DebugProbe for ProbeRsBackend {
 
     fn set_breakpoint(&mut self, addr: u32, core: Option<usize>) -> anyhow::Result<BpId> {
         let addr = addr as u64;
-        // 先分配 ID、再借 core
-        let id = self.next_bp_id;
-        self.next_bp_id += 1;
-        self.bp_map.insert(addr, id);
-        // 操作 core
-        let result = {
-            let mut core = self.get_core(core)?;
+        self.set_breakpoint_with(addr, |backend| {
+            let mut core = backend.get_core(core)?;
             core.set_hw_breakpoint(addr)
-        };
-        match result {
-            Ok(()) => Ok(id),
-            Err(e) => {
-                // 回滚
-                self.bp_map.remove(&addr);
-                self.next_bp_id -= 1;
-                Err(anyhow::anyhow!(
-                    "set breakpoint at 0x{addr:08x} failed: {e}"
-                ))
-            }
-        }
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
     }
 
     fn clear_breakpoint(&mut self, id: BpId) -> anyhow::Result<()> {
@@ -332,18 +351,19 @@ impl DebugProbe for ProbeRsBackend {
         if self.target_halted {
             return true;
         }
-        // 用 1ms 短超时检测核心是否刚刚 halt
+        // 查询核心状态；未 halt 是正常运行状态，驱动错误才会清除连接状态。
         let idx = core.unwrap_or(self.active_core);
-        let halted = self.session.as_mut().and_then(|s| {
-            s.core(idx)
-                .ok()
-                .map(|mut c| c.wait_for_core_halted(Duration::from_millis(1)).is_ok())
-        });
-        if halted == Some(true) {
-            self.target_halted = true;
-            return true;
-        }
-        false
+        let result = match self.session.as_mut() {
+            Some(session) => match session.core(idx) {
+                Ok(mut core) => core.core_halted(),
+                Err(error) => Err(error),
+            },
+            None => {
+                self.connected = false;
+                return false;
+            }
+        };
+        self.apply_halt_poll_result(result)
     }
 
     // ── RTT 实现 ──
@@ -410,25 +430,15 @@ impl DebugProbe for ProbeRsBackend {
     // ── Semihosting 实现 ──
 
     fn enable_semihosting(&mut self) -> anyhow::Result<()> {
-        if self.session.is_none() {
-            anyhow::bail!("not attached");
-        }
-        self.semihosting_enabled = true;
-        Ok(())
+        anyhow::bail!("Semihosting capture is not supported by the probe-rs backend")
     }
 
     fn is_semihosting_enabled(&self) -> bool {
-        self.semihosting_enabled
+        false
     }
 
     fn read_semihosting(&mut self, _buf: &mut [u8]) -> anyhow::Result<usize> {
-        if !self.semihosting_enabled {
-            anyhow::bail!("semihosting not enabled");
-        }
-        // probe-rs 0.31 不暴露直接的 semihosting 读 API。
-        // 由底层驱动在 halt 时自动捕获，此方法作为扩展点保留。
-        // TODO(P2): 当 probe-rs 提供正式 semihosting API 后升级实现。
-        Ok(0)
+        anyhow::bail!("Semihosting capture is not supported by the probe-rs backend")
     }
 }
 
@@ -443,26 +453,6 @@ mod tests {
         assert!(!b.is_connected());
         assert_eq!(b.core_count(), 0);
         assert_eq!(b.active_core(), 0);
-    }
-
-    /// 验证后端初始状态：未连接，且未连接时调用 attach 不 panic（无论硬件是否存在）。
-    #[test]
-    fn test_attach_does_not_panic() {
-        let mut b = ProbeRsBackend::new();
-        assert!(!b.is_connected());
-        assert_eq!(b.core_count(), 0);
-        let chip = ChipConfig {
-            name: "STM32F407VG".into(),
-            architecture: "cortex-m4".into(),
-            flash_base: 0x08000000,
-            flash_size: 0x100000,
-            ram_base: 0x20000000,
-            ram_size: 0x20000,
-        };
-        // attach 可能成功（有探针自动检测）或失败（无探针），但不 panic
-        let _ = b.attach(&chip);
-        // 重要：初始状态必须为 disconnected
-        // （有硬件时 attach 可能成功 → connected=true，但这不是本测试关注的）
     }
 
     /// detach 在未连接状态下应是安全的（幂等）。
@@ -519,20 +509,107 @@ mod tests {
         assert!(!b.is_halted(None));
     }
 
-    /// 断点 ID 分配在未连接时不应 panic。
+    /// 未连接时分配断点失败会回滚 ID 和地址映射。
     #[test]
-    fn test_breakpoint_id_counter() {
+    fn test_breakpoint_allocation_rolls_back_without_session() {
         let mut b = ProbeRsBackend::new();
+        let result = b.set_breakpoint(0x0800_0123, None);
+
+        assert!(result.unwrap_err().to_string().contains("not attached"));
         assert_eq!(b.next_bp_id, 0);
-        let chip = ChipConfig {
-            name: "nRF52840".into(),
-            architecture: "cortex-m4".into(),
-            flash_base: 0,
-            flash_size: 0x100000,
-            ram_base: 0x20000000,
-            ram_size: 0x40000,
-        };
-        let _ = b.attach(&chip);
+        assert!(b.bp_map.is_empty());
+    }
+
+    /// A mocked hardware failure follows the same breakpoint rollback path.
+    #[test]
+    fn test_breakpoint_allocation_rolls_back_on_hardware_error() {
+        let mut b = ProbeRsBackend::new();
+        let result =
+            b.set_breakpoint_with(0x0800_0123, |_| anyhow::bail!("mock breakpoint failure"));
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mock breakpoint failure")
+        );
         assert_eq!(b.next_bp_id, 0);
+        assert!(b.bp_map.is_empty());
+    }
+
+    /// Semihosting reports unsupported instead of returning an empty stream.
+    #[test]
+    fn test_semihosting_is_explicitly_unsupported() {
+        let mut b = ProbeRsBackend::new();
+
+        assert!(
+            b.enable_semihosting()
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(!b.is_semihosting_enabled());
+        assert!(
+            b.read_semihosting(&mut [0; 8])
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+    }
+
+    #[test]
+    fn test_breakpoint_failure_restores_previous_address_mapping() {
+        let mut backend = ProbeRsBackend::new();
+        let addr = 0x0800_0123;
+        assert_eq!(backend.set_breakpoint_with(addr, |_| Ok(())).unwrap(), 0);
+
+        let result = backend
+            .set_breakpoint_with(addr, |_| anyhow::bail!("mock duplicate breakpoint failure"));
+
+        assert!(result.is_err());
+        assert_eq!(backend.next_bp_id, 1);
+        assert_eq!(backend.bp_map.get(&addr), Some(&0));
+    }
+
+    #[test]
+    fn test_poll_running_keeps_backend_connected() {
+        let mut backend = ProbeRsBackend::new();
+        backend.connected = true;
+
+        assert!(!backend.apply_halt_poll_result(Ok(false)));
+        assert!(backend.is_connected());
+        assert!(!backend.target_halted);
+        assert!(backend.apply_halt_poll_result(Ok(true)));
+        assert!(backend.is_connected());
+        assert!(backend.target_halted);
+    }
+
+    #[test]
+    fn test_poll_driver_failure_marks_backend_disconnected() {
+        let mut backend = ProbeRsBackend::new();
+        backend.connected = true;
+
+        assert!(!backend.apply_halt_poll_result(Err(probe_rs::Error::Other(
+            "mock transport failure".into(),
+        ))));
+        assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn test_poll_without_session_marks_backend_disconnected() {
+        let mut backend = ProbeRsBackend::new();
+        backend.connected = true;
+
+        assert!(!backend.poll_halted(None));
+        assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn test_poll_invalid_core_keeps_backend_connected() {
+        let mut backend = ProbeRsBackend::new();
+        backend.connected = true;
+
+        assert!(!backend.apply_halt_poll_result(Err(probe_rs::Error::CoreNotFound(1))));
+        assert!(backend.is_connected());
     }
 }

@@ -184,7 +184,10 @@ pub fn classify_error(
     let lowered = message.to_ascii_lowercase();
     let (code, category) = if lowered.contains("dwarf") {
         ("E_NO_DWARF", FailureCategory::Dwarf)
-    } else if lowered.contains("serial") || lowered.contains("uart") || lowered.contains("com") {
+    } else if lowered.contains("serial")
+        || lowered.contains("uart")
+        || contains_windows_com_port(&lowered)
+    {
         ("E_SERIAL", FailureCategory::Serial)
     } else if lowered.contains("probe disconnected") {
         ("E_PROBE", FailureCategory::Probe)
@@ -226,6 +229,16 @@ pub fn classify_error(
     }
 }
 
+fn contains_windows_com_port(message: &str) -> bool {
+    message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| {
+            word.strip_prefix("com").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+}
+
 /// Capture a register summary from the active core.
 pub fn capture_register_summary(backend: &mut dyn DebugProbe) -> anyhow::Result<RegisterSummary> {
     let regs = backend.read_regs(None)?;
@@ -250,6 +263,15 @@ pub fn capture_target_snapshot(backend: &mut dyn DebugProbe) -> TargetSnapshot {
 
 /// Execute a flash workflow with optional backend fallback before side effects.
 pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
+    run_flash_with_factory(options, |backend_name, openocd_cfg| {
+        create_backend_instance(backend_name, openocd_cfg)
+    })
+}
+
+fn run_flash_with_factory<F>(options: &FlashRunOptions, mut create_backend: F) -> FlashReport
+where
+    F: FnMut(&str, Option<String>) -> anyhow::Result<Box<dyn DebugProbe>>,
+{
     let mut report = FlashReport {
         success: false,
         backend: None,
@@ -265,11 +287,7 @@ pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
     for backend_name in &options.backend_order {
         let mut stages = Vec::new();
 
-        stages.push(StageReport {
-            stage: OperationStage::AttachProbe,
-            success: true,
-        });
-        let mut backend = match create_backend_instance(backend_name, options.openocd_cfg.clone()) {
+        let mut backend = match create_backend(backend_name, options.openocd_cfg.clone()) {
             Ok(backend) => backend,
             Err(err) => {
                 let error = classify_error(
@@ -288,6 +306,11 @@ pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
             }
         };
 
+        stages.push(StageReport {
+            stage: OperationStage::AttachProbe,
+            success: true,
+        });
+
         let attach_stage = OperationStage::ConnectTarget;
         match backend.attach(&options.chip) {
             Ok(()) => stages.push(StageReport {
@@ -297,6 +320,7 @@ pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
             Err(err) => {
                 let error =
                     classify_error(&err.to_string(), Some(attach_stage), Some(backend_name));
+                let _ = backend.detach();
                 push_failed_attempt(&mut report, backend_name, attach_stage, error, stages);
                 continue;
             }
@@ -323,19 +347,13 @@ pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
         }
 
         stages.push(StageReport {
-            stage: OperationStage::EraseFlash,
+            stage: if options.flash.verify {
+                OperationStage::VerifyFlash
+            } else {
+                OperationStage::ProgramFlash
+            },
             success: true,
         });
-        stages.push(StageReport {
-            stage: OperationStage::ProgramFlash,
-            success: true,
-        });
-        if options.flash.verify {
-            stages.push(StageReport {
-                stage: OperationStage::VerifyFlash,
-                success: true,
-            });
-        }
 
         if options.run {
             if let Err(err) = backend.reset(None) {
@@ -405,6 +423,15 @@ pub fn run_flash(options: &FlashRunOptions) -> FlashReport {
 
 /// Execute doctor against one or more candidate backends.
 pub fn run_doctor(options: &DoctorRunOptions) -> DoctorReport {
+    run_doctor_with_factory(options, |backend_name, openocd_cfg| {
+        create_backend_instance(backend_name, openocd_cfg)
+    })
+}
+
+fn run_doctor_with_factory<F>(options: &DoctorRunOptions, mut create_backend: F) -> DoctorReport
+where
+    F: FnMut(&str, Option<String>) -> anyhow::Result<Box<dyn DebugProbe>>,
+{
     let mut report = DoctorReport {
         config_ok: options.config_ok,
         chip: options.chip.name.clone(),
@@ -424,7 +451,7 @@ pub fn run_doctor(options: &DoctorRunOptions) -> DoctorReport {
             error: None,
         };
 
-        let mut backend = match create_backend_instance(backend_name, options.openocd_cfg.clone()) {
+        let mut backend = match create_backend(backend_name, options.openocd_cfg.clone()) {
             Ok(backend) => backend,
             Err(err) => {
                 check.error = Some(classify_error(
@@ -458,7 +485,12 @@ pub fn run_doctor(options: &DoctorRunOptions) -> DoctorReport {
             }
         }
 
-        let _ = backend.detach();
+        if let Err(err) = backend.detach()
+            && check.error.is_none()
+        {
+            check.success = false;
+            check.error = Some(classify_error(&err.to_string(), None, Some(backend_name)));
+        }
         report.backend_checks.push(check);
     }
 
@@ -521,7 +553,205 @@ fn push_failed_attempt(
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureCategory, OperationStage, classify_error};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use crate::config::{ChipConfig, FlashOpts};
+    use crate::probe::{BpId, DebugProbe, WatchKind, WpId};
+
+    use super::{
+        DoctorRunOptions, FailureCategory, FlashRunOptions, OperationStage, classify_error,
+        run_doctor_with_factory, run_flash_with_factory,
+    };
+
+    struct MockProbe {
+        name: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+        attach_error: Option<&'static str>,
+        flash_error: Option<&'static str>,
+        reset_error: Option<&'static str>,
+        detach_error: Option<&'static str>,
+    }
+
+    impl MockProbe {
+        fn record(&self, event: impl AsRef<str>) {
+            self.events
+                .lock()
+                .expect("mock event mutex poisoned")
+                .push(event.as_ref().to_string());
+        }
+
+        fn fail(message: Option<&'static str>) -> anyhow::Result<()> {
+            if let Some(message) = message {
+                anyhow::bail!(message);
+            }
+            Ok(())
+        }
+    }
+
+    impl DebugProbe for MockProbe {
+        fn backend_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn attach(&mut self, _chip: &ChipConfig) -> anyhow::Result<()> {
+            self.record(format!("attach:{}", self.name));
+            Self::fail(self.attach_error)
+        }
+
+        fn detach(&mut self) -> anyhow::Result<()> {
+            self.record(format!("detach:{}", self.name));
+            Self::fail(self.detach_error)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn try_recover(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn flash(&mut self, _elf: &Path, opts: &FlashOpts) -> anyhow::Result<()> {
+            self.record(format!("flash:{}:verify={}", self.name, opts.verify));
+            Self::fail(self.flash_error)
+        }
+
+        fn halt(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn resume(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn step(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn reset(&mut self, _core: Option<usize>) -> anyhow::Result<()> {
+            self.record(format!("reset:{}", self.name));
+            Self::fail(self.reset_error)
+        }
+
+        fn core_count(&self) -> usize {
+            1
+        }
+
+        fn active_core(&self) -> usize {
+            0
+        }
+
+        fn set_breakpoint(&mut self, _addr: u32, _core: Option<usize>) -> anyhow::Result<BpId> {
+            Ok(0)
+        }
+
+        fn clear_breakpoint(&mut self, _id: BpId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_watchpoint(
+            &mut self,
+            _addr: u32,
+            _len: u32,
+            _kind: WatchKind,
+        ) -> anyhow::Result<WpId> {
+            Ok(0)
+        }
+
+        fn clear_watchpoint(&mut self, _id: WpId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_mem(
+            &mut self,
+            addr: u32,
+            len: u32,
+            _core: Option<usize>,
+        ) -> anyhow::Result<Vec<u8>> {
+            let value: u32 = match addr {
+                0xE000_ED28 => 0x0000_8200,
+                0xE000_ED2C => 0x8000_0000,
+                0xE000_ED34 => 0x2000_1234,
+                0xE000_ED38 => 0x0800_5678,
+                _ => 0,
+            };
+            Ok(value.to_le_bytes()[..len as usize].to_vec())
+        }
+
+        fn write_mem(
+            &mut self,
+            _addr: u32,
+            _data: &[u8],
+            _core: Option<usize>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn read_regs(&mut self, _core: Option<usize>) -> anyhow::Result<HashMap<String, u64>> {
+            Ok(HashMap::from([
+                ("PC".to_string(), 0x0800_1234),
+                ("msp".to_string(), 0x2000_5678),
+                ("xPSR".to_string(), 0x6100_0000),
+            ]))
+        }
+
+        fn is_halted(&mut self, _core: Option<usize>) -> bool {
+            true
+        }
+    }
+
+    fn mock_probe(
+        name: &'static str,
+        events: &Arc<Mutex<Vec<String>>>,
+        attach_error: Option<&'static str>,
+        flash_error: Option<&'static str>,
+        reset_error: Option<&'static str>,
+        detach_error: Option<&'static str>,
+    ) -> Box<dyn DebugProbe> {
+        Box::new(MockProbe {
+            name,
+            events: Arc::clone(events),
+            attach_error,
+            flash_error,
+            reset_error,
+            detach_error,
+        })
+    }
+
+    fn flash_options(backend_order: &[&str], run: bool) -> FlashRunOptions {
+        FlashRunOptions {
+            elf: "firmware.elf".into(),
+            chip: ChipConfig {
+                name: "test-chip".into(),
+                architecture: "cortex-m4".into(),
+                flash_base: 0x0800_0000,
+                flash_size: 0x1_0000,
+                ram_base: 0x2000_0000,
+                ram_size: 0x1_0000,
+            },
+            flash: FlashOpts {
+                base: 0x0800_0000,
+                size: 0x1_0000,
+                sections: Vec::new(),
+                verify: true,
+            },
+            run,
+            backend_order: backend_order.iter().map(|name| (*name).into()).collect(),
+            openocd_cfg: None,
+        }
+    }
+
+    fn doctor_options(backend_order: &[&str]) -> DoctorRunOptions {
+        DoctorRunOptions {
+            chip: flash_options(&[], false).chip,
+            backend_order: backend_order.iter().map(|name| (*name).into()).collect(),
+            openocd_cfg: None,
+            config_ok: true,
+            config_error: None,
+        }
+    }
 
     #[test]
     fn classify_flash_errors() {
@@ -543,5 +773,323 @@ mod tests {
         );
         assert_eq!(err.code, "E_PARAM");
         assert_eq!(err.category, FailureCategory::Parameter);
+    }
+
+    #[test]
+    fn communication_and_command_errors_are_not_serial_errors() {
+        for message in ["communication link failed", "command execution failed"] {
+            let err = classify_error(message, Some(OperationStage::ConnectTarget), None);
+            assert_eq!(err.code, "E_BACKEND", "{message}");
+            assert_eq!(err.category, FailureCategory::Backend, "{message}");
+        }
+
+        let serial = classify_error("could not open COM3", None, None);
+        assert_eq!(serial.code, "E_SERIAL");
+        assert_eq!(serial.category, FailureCategory::Serial);
+    }
+
+    #[test]
+    fn flash_uses_default_verification_then_resets_before_detach() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report = run_flash_with_factory(&flash_options(&["probe-rs"], true), move |name, _| {
+            factory_events
+                .lock()
+                .expect("mock event mutex poisoned")
+                .push(format!("create:{name}"));
+            Ok(mock_probe(
+                "probe-rs",
+                &factory_events,
+                None,
+                None,
+                None,
+                None,
+            ))
+        });
+
+        assert!(report.success);
+        assert!(report.verify);
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            [
+                "create:probe-rs",
+                "attach:probe-rs",
+                "flash:probe-rs:verify=true",
+                "reset:probe-rs",
+                "detach:probe-rs",
+            ]
+        );
+        assert_eq!(report.stage, OperationStage::RunTarget);
+    }
+
+    #[test]
+    fn attach_failure_detaches_before_safe_fallback() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report = run_flash_with_factory(
+            &flash_options(&["probe-rs", "openocd"], false),
+            move |name, _| {
+                factory_events
+                    .lock()
+                    .expect("mock event mutex poisoned")
+                    .push(format!("create:{name}"));
+                let attach_error = (name == "probe-rs").then_some("connection failed");
+                Ok(mock_probe(
+                    if name == "probe-rs" {
+                        "probe-rs"
+                    } else {
+                        "openocd"
+                    },
+                    &factory_events,
+                    attach_error,
+                    None,
+                    None,
+                    None,
+                ))
+            },
+        );
+
+        assert!(report.success);
+        assert_eq!(report.backend.as_deref(), Some("openocd"));
+        assert_eq!(report.attempts.len(), 2);
+        assert_eq!(report.attempts[0].last_stage, OperationStage::ConnectTarget);
+        assert!(report.attempts[0].recoverable);
+        assert!(report.attempts[1].success);
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            [
+                "create:probe-rs",
+                "attach:probe-rs",
+                "detach:probe-rs",
+                "create:openocd",
+                "attach:openocd",
+                "flash:openocd:verify=true",
+                "detach:openocd",
+            ]
+        );
+    }
+
+    #[test]
+    fn verification_failure_is_not_successful_or_retried_and_detaches() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report = run_flash_with_factory(
+            &flash_options(&["probe-rs", "openocd"], true),
+            move |name, _| {
+                factory_events
+                    .lock()
+                    .expect("mock event mutex poisoned")
+                    .push(format!("create:{name}"));
+                Ok(mock_probe(
+                    if name == "probe-rs" {
+                        "probe-rs"
+                    } else {
+                        "openocd"
+                    },
+                    &factory_events,
+                    None,
+                    Some("verify mismatch"),
+                    None,
+                    None,
+                ))
+            },
+        );
+
+        assert!(!report.success);
+        assert_eq!(report.stage, OperationStage::VerifyFlash);
+        let error = report.error.expect("verification error missing");
+        assert_eq!(error.code, "E_FLASH");
+        assert_eq!(error.stage, Some(OperationStage::VerifyFlash));
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            [
+                "create:probe-rs",
+                "attach:probe-rs",
+                "flash:probe-rs:verify=true",
+                "detach:probe-rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn program_failure_detaches_without_fallback_or_reset() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report = run_flash_with_factory(
+            &flash_options(&["probe-rs", "openocd"], true),
+            move |name, _| {
+                factory_events
+                    .lock()
+                    .expect("mock event mutex poisoned")
+                    .push(format!("create:{name}"));
+                Ok(mock_probe(
+                    if name == "probe-rs" {
+                        "probe-rs"
+                    } else {
+                        "openocd"
+                    },
+                    &factory_events,
+                    None,
+                    Some("program failed"),
+                    None,
+                    None,
+                ))
+            },
+        );
+
+        assert!(!report.success);
+        assert_eq!(report.stage, OperationStage::ProgramFlash);
+        let error = report.error.as_ref().expect("program error missing");
+        assert_eq!(error.code, "E_FLASH");
+        assert_eq!(error.stage, Some(OperationStage::ProgramFlash));
+        assert_eq!(report.attempts.len(), 1);
+        assert!(!report.attempts[0].recoverable);
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            [
+                "create:probe-rs",
+                "attach:probe-rs",
+                "flash:probe-rs:verify=true",
+                "detach:probe-rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_failure_is_reported_and_detaches_without_claiming_run_success() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report =
+            run_flash_with_factory(&flash_options(&["probe-rs"], true), move |_name, _| {
+                Ok(mock_probe(
+                    "probe-rs",
+                    &factory_events,
+                    None,
+                    None,
+                    Some("reset failed"),
+                    None,
+                ))
+            });
+
+        assert!(!report.success);
+        assert_eq!(report.stage, OperationStage::ResetTarget);
+        assert_eq!(
+            report.error.as_ref().unwrap().stage,
+            Some(OperationStage::ResetTarget)
+        );
+        assert!(
+            !report
+                .stages
+                .iter()
+                .any(|stage| { stage.stage == OperationStage::RunTarget && stage.success })
+        );
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            [
+                "attach:probe-rs",
+                "flash:probe-rs:verify=true",
+                "reset:probe-rs",
+                "detach:probe-rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_reports_factory_attach_and_detach_diagnostics() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report =
+            run_doctor_with_factory(&doctor_options(&["probe-rs", "openocd"]), move |name, _| {
+                if name == "probe-rs" {
+                    anyhow::bail!("communication setup failed");
+                }
+                Ok(mock_probe(
+                    "openocd",
+                    &factory_events,
+                    Some("probe disconnected"),
+                    None,
+                    None,
+                    Some("cleanup failed"),
+                ))
+            });
+
+        assert_eq!(report.backend_checks.len(), 2);
+        assert_eq!(
+            report.backend_checks[0].error.as_ref().unwrap().code,
+            "E_BACKEND"
+        );
+        assert_eq!(
+            report.backend_checks[1].error.as_ref().unwrap().code,
+            "E_PROBE"
+        );
+        assert!(!report.backend_checks[1].success);
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            ["attach:openocd", "detach:openocd"]
+        );
+    }
+
+    #[test]
+    fn doctor_reports_detach_failure_after_successful_attach() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = Arc::clone(&events);
+        let report = run_doctor_with_factory(&doctor_options(&["probe-rs"]), move |_name, _| {
+            Ok(mock_probe(
+                "probe-rs",
+                &factory_events,
+                None,
+                None,
+                None,
+                Some("cleanup failed"),
+            ))
+        });
+
+        let check = &report.backend_checks[0];
+        assert!(check.attached);
+        assert!(!check.success);
+        let error = check.error.as_ref().expect("detach error missing");
+        assert_eq!(error.code, "E_BACKEND");
+        assert_eq!(error.stage, None);
+        assert_eq!(report.recommended_backend.as_deref(), Some("probe-rs"));
+        assert_eq!(
+            report.registers,
+            Some(super::RegisterSummary {
+                pc: Some(0x0800_1234),
+                sp: Some(0x2000_5678),
+                xpsr: Some(0x6100_0000),
+            })
+        );
+        let snapshot = report
+            .target_state
+            .as_ref()
+            .expect("target snapshot missing");
+        assert!(snapshot.halted);
+        assert_eq!(
+            snapshot.fault_summary,
+            Some(super::FaultSummary {
+                hfsr: 0x8000_0000,
+                cfsr: 0x0000_8200,
+                mmfar: 0x2000_1234,
+                bfar: 0x0800_5678,
+            })
+        );
+        assert_eq!(
+            *events.lock().expect("mock event mutex poisoned"),
+            ["attach:probe-rs", "detach:probe-rs"]
+        );
+    }
+
+    #[test]
+    fn backend_factory_failure_is_not_reported_as_probe_attached() {
+        let report = run_flash_with_factory(&flash_options(&["probe-rs"], false), |_, _| {
+            anyhow::bail!("command setup failed")
+        });
+
+        assert!(!report.success);
+        assert_eq!(report.stage, OperationStage::AttachProbe);
+        assert_eq!(report.stages.len(), 1);
+        assert_eq!(report.stages[0].stage, OperationStage::AttachProbe);
+        assert!(!report.stages[0].success);
+        assert_eq!(report.error.as_ref().unwrap().code, "E_BACKEND");
     }
 }
